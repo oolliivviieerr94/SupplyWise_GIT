@@ -7,23 +7,22 @@ export type Supplement = {
   name: string;
   category?: string | null;
 
-  // normalized/scored fields used by the UI/algorithm
   score_global?: number | null;
-  research_count?: number | null;      // nb_etudes
-  price_eur_month?: number | null;     // cout_moyen_mensuel_eur
-  quality_level?: string | null;       // 'A' | 'B' | 'C' or 'high/medium/low'
+  research_count?: number | null;
+  price_eur_month?: number | null;
+  quality_level?: string | null;
   is_active?: boolean | null;
 
-  // detailed scores (jsonb) — utile pour library & reco
+  // détaillés
   scores?: Record<string, number> | null;
 
-  // optional extra fields (kept if present in DB)
+  // extra possibles
   dose_usual_min?: number | null;
   dose_usual_max?: number | null;
   dose_unit?: string | null;
   timing_label?: string | null;
 
-  // French CSV fallbacks (we keep them on the object for UI helpers)
+  // fallbacks CSV FR
   dosage_recommande?: string | null;
   frequence?: string | null;
   cout_moyen_mensuel_eur?: number | null;
@@ -50,7 +49,8 @@ async function tableExists(name: string): Promise<boolean> {
 }
 async function sampleRow(table: string): Promise<Record<string, any> | null> {
   try {
-    const { data } = await supabase.from(table).select('*').limit(1);
+    const { data, error } = await supabase.from(table).select('*').limit(1);
+    if (error) return null;
     return data?.[0] ?? null;
   } catch {
     return null;
@@ -80,9 +80,9 @@ let cachedHasIsActive = false;
 function translateQuality(q: string | null | undefined): string | null {
   if (!q) return null;
   const v = q.toString().toLowerCase();
-  if (['a', 'élevée', 'elevee', 'elevée', 'eleve', 'high', 'forte', 'strong'].some(x => v.includes(x))) return 'A';
-  if (['b', 'moyenne', 'medium', 'modérée', 'moderee'].some(x => v.includes(x))) return 'B';
-  if (['c', 'faible', 'low', 'limitée', 'limitee'].some(x => v.includes(x))) return 'C';
+  if (['a', 'élevée', 'elevee', 'elevée', 'eleve', 'high'].some(x => v.includes(x))) return 'A';
+  if (['b', 'moyenne', 'medium'].some(x => v.includes(x))) return 'B';
+  if (['c', 'faible', 'low'].some(x => v.includes(x))) return 'C';
   return null;
 }
 
@@ -91,23 +91,18 @@ async function getSupplementSelect(): Promise<{ select: string; hasIsActive: boo
 
   const sample = await sampleRow('supplement');
 
-  // Add both English + French CSV column candidates
+  // IMPORTANT: on inclut aussi "scores"
   const candidates = [
-    // ids/slugs/names
-    'id', 'slug', 'name', 'nom', 'nom_normalise',
-    // taxonomy
-    'category', 'categorie',
-    // scoring
-    'score_global', 'score_global_adapte',
-    'research_count', 'nb_etudes',
-    'price_eur_month', 'cout_moyen_mensuel_eur',
-    'quality_level', 'qualite_etudes',
+    'id','slug','name','nom','nom_normalise',
+    'category','categorie',
+    'score_global','score_global_adapte',
+    'research_count','nb_etudes',
+    'price_eur_month','cout_moyen_mensuel_eur',
+    'quality_level','qualite_etudes',
     'is_active',
-    // detailed json scores
-    'scores',
-    // dosage / timing
-    'dose_usual_min', 'dose_usual_max', 'dose_unit', 'timing_label',
-    'dosage_recommande', 'frequence',
+    'scores', // <— AJOUT
+    'dose_usual_min','dose_usual_max','dose_unit','timing_label',
+    'dosage_recommande','frequence',
   ];
 
   const present = candidates.filter(c => sample && c in sample);
@@ -121,17 +116,10 @@ function normalizeSupplement(row: Record<string, any>): Supplement {
   const name = (row.name ?? row.nom ?? slug).toString();
   const category = (row.category ?? row.categorie ?? null) as string | null;
 
-  const score_global =
-    (row.score_global ?? row.score_global_adapte ?? null) as number | null;
-
-  const research_count =
-    (row.research_count ?? row.nb_etudes ?? null) as number | null;
-
-  const price_eur_month =
-    (row.price_eur_month ?? row.cout_moyen_mensuel_eur ?? null) as number | null;
-
-  const quality_level =
-    (row.quality_level as string | null) ?? translateQuality(row.qualite_etudes);
+  const score_global = (row.score_global ?? row.score_global_adapte ?? null) as number | null;
+  const research_count = (row.research_count ?? row.nb_etudes ?? null) as number | null;
+  const price_eur_month = (row.price_eur_month ?? row.cout_moyen_mensuel_eur ?? null) as number | null;
+  const quality_level = (row.quality_level as string | null) ?? translateQuality(row.qualite_etudes);
 
   const s: Supplement = {
     id: row.id,
@@ -143,11 +131,8 @@ function normalizeSupplement(row: Record<string, any>): Supplement {
     price_eur_month,
     quality_level,
     is_active: row.is_active ?? null,
+    scores: row.scores ?? null,
 
-    // detailed scores if present
-    scores: (row.scores ?? null) as Record<string, number> | null,
-
-    // keep optional fields if present
     dose_usual_min: row.dose_usual_min ?? null,
     dose_usual_max: row.dose_usual_max ?? null,
     dose_unit: row.dose_unit ?? null,
@@ -175,10 +160,18 @@ async function fetchSupplementsByKeys(keys: string[], keyType: 'id' | 'slug'): P
     keyType === 'id' ? await q.in('id', keys) : await q.in('slug', keys);
 
   if (error) throw error;
-  return ((data || []) as any[]).map(normalizeSupplement);
+  // dédoublonnage défensif
+  const seen = new Set<string>();
+  const out: Supplement[] = [];
+  for (const row of (data || []) as any[]) {
+    const s = normalizeSupplement(row);
+    const key = String(s.id) + '::' + s.slug;
+    if (!seen.has(key)) { seen.add(key); out.push(s); }
+  }
+  return out;
 }
 
-/* ---------- API ---------- */
+/* ---------- PUBLIC API ---------- */
 export async function listObjectiveGroups(): Promise<ObjectiveGroup[]> {
   const { data, error } = await supabase
     .from('v_objective_groups')
@@ -188,15 +181,80 @@ export async function listObjectiveGroups(): Promise<ObjectiveGroup[]> {
   return (data || []) as ObjectiveGroup[];
 }
 
+/** Harmonisé pour recos ET autres écrans — renvoie les slugs de groupes d’objectifs de l’utilisateur. */
+export async function getUserObjectiveGroupSlugs(userId?: string): Promise<{ slugs: string[]; source: string }> {
+  // 0) user id
+  let uid = userId;
+  if (!uid) {
+    const { data: { user } } = await supabase.auth.getUser();
+    uid = user?.id;
+  }
+  if (!uid) return { slugs: [], source: 'none' };
+
+  // 1) user_objective_group (colonne robuste)
+  if (await tableExists('user_objective_group')) {
+    const sample = await sampleRow('user_objective_group');
+    const kGroup = firstKey(sample, ['group_slug', 'objective_group_slug', 'group']);
+    const kUser  = firstKey(sample, ['user_id', 'user']);
+    if (kGroup && kUser) {
+      const { data, error } = await supabase
+        .from('user_objective_group')
+        .select(`${kGroup}`)
+        .eq(kUser, uid);
+      if (!error && data?.length) {
+        const slugs = Array.from(new Set((data as any[]).map(r => String(r[kGroup])).filter(Boolean)));
+        if (slugs.length) return { slugs, source: 'user_objective_group' };
+      }
+    }
+  }
+
+  // 2) user_profiles.objective_groups (si présent)
+  if (await tableExists('user_profiles')) {
+    const sample = await sampleRow('user_profiles');
+    const kUser  = firstKey(sample, ['user_id', 'id', 'user']);
+    const kOgArr = firstKey(sample, ['objective_groups', 'objective_group_slugs']);
+    if (kUser && kOgArr) {
+      const { data } = await supabase.from('user_profiles').select(`${kOgArr}`).eq(kUser, uid).maybeSingle();
+      const arr = Array.isArray((data as any)?.[kOgArr]) ? (data as any)[kOgArr] as string[] : [];
+      const slugs = Array.from(new Set(arr.map(String).filter(Boolean)));
+      if (slugs.length) return { slugs, source: 'user_profiles' };
+    }
+  }
+
+  // 3) fallback via objective_tag mapping
+  if (await tableExists('user_objective') && await tableExists('objective_tag')) {
+    const uoSample = await sampleRow('user_objective');
+    const kUser = firstKey(uoSample, ['user_id', 'user']);
+    const kObj  = firstKey(uoSample, ['objective_slug', 'objective', 'tag_slug']);
+    const { data: rows } = await supabase.from('user_objective').select(`${kObj}`).eq(kUser!, uid);
+    const tags = (rows || []).map(r => String((r as any)[kObj!])).filter(Boolean);
+    if (tags.length) {
+      const otSample = await sampleRow('objective_tag');
+      const kSlug = firstKey(otSample, ['slug', 'objective_tag_slug']);
+      const kGrp  = firstKey(otSample, ['group_slug', 'objective_group_slug', 'group']);
+      if (kSlug && kGrp) {
+        const { data: ot } = await supabase
+          .from('objective_tag')
+          .select(`${kSlug},${kGrp}`)
+          .in(kSlug, tags);
+        const groups = Array.from(new Set((ot || []).map((t: any) => String(t[kGrp])).filter(Boolean)));
+        if (groups.length) return { slugs: groups, source: 'user_objective→objective_tag' };
+      }
+    }
+  }
+
+  return { slugs: [], source: 'none' };
+}
+
 /**
- * Algo “comme avant” — priorité à v_supplement_group_link (AND strict),
- * repli v_supplement_grouped_tags, puis mapping objective_tag.
- * Limite: 15 max.
+ * Recherche par groupes (AND strict si `andMode`).
+ * Priorité: v_supplement_group_link → v_supplement_grouped_tags → mapping objective_tag.
+ * Retourne max 15, triés score puis nb études.
  */
 export async function searchSupplementsByGroups(groupSlugs: string[], andMode: boolean): Promise<Supplement[]> {
   if (!groupSlugs || groupSlugs.length === 0) return [];
 
-  // 1) Source prioritaire : v_supplement_group_link (supplement_id/slug, group_slug)
+  // 1) v_supplement_group_link
   if (await tableExists('v_supplement_group_link')) {
     const sample = await sampleRow('v_supplement_group_link');
     const kSupp = firstKey(sample, ['supplement_id', 'supplement_slug', 'supplement']);
@@ -226,7 +284,7 @@ export async function searchSupplementsByGroups(groupSlugs: string[], andMode: b
     }
   }
 
-  // 2) Repli : ancienne vue v_supplement_grouped_tags si elle existe encore
+  // 2) v_supplement_grouped_tags
   if (await tableExists('v_supplement_grouped_tags')) {
     const sample = await sampleRow('v_supplement_grouped_tags');
     const kSupp = firstKey(sample, ['supplement_id', 'supplement', 'supplement_slug']);
@@ -256,7 +314,7 @@ export async function searchSupplementsByGroups(groupSlugs: string[], andMode: b
     }
   }
 
-  // 3) Fallback : objective_tag + supplement_objective_tag
+  // 3) fallback: objective_tag + supplement_objective_tag
   if (!(await tableExists('objective_tag')) || !(await tableExists('supplement_objective_tag'))) {
     return [];
   }
@@ -305,64 +363,4 @@ export async function searchSupplementsByGroups(groupSlugs: string[], andMode: b
   const keyType: 'id' | 'slug' = kSOTSupp === 'supplement_slug' ? 'slug' : 'id';
   const meta = await fetchSupplementsByKeys(wanted, keyType);
   return sortSupps(meta).slice(0, 15);
-}
-
-/* ---------- NEW: lecture robuste des groupes objectifs utilisateur ---------- */
-export async function getUserObjectiveGroupSlugs(userId?: string | null): Promise<{ slugs: string[]; source: string }> {
-  // si userId non fourni, on regarde la session
-  let uid = userId ?? null;
-  if (!uid) {
-    try {
-      const { data: { user } } = await supabase.auth.getUser();
-      uid = user?.id ?? null;
-    } catch {}
-  }
-  if (!uid) return { slugs: [], source: 'none' };
-
-  // 1) table officielle user_objective_group
-  try {
-    const { data, error } = await supabase
-      .from('user_objective_group')
-      .select('group_slug, objective_group_slug')
-      .eq('user_id', uid);
-    if (!error && data?.length) {
-      const slugs = Array.from(new Set(
-        data.map((r: any) => String(r.group_slug ?? r.objective_group_slug ?? '')).filter(Boolean)
-      ));
-      if (slugs.length) return { slugs, source: 'user_objective_group' };
-    }
-  } catch {}
-
-  // 2) profil (user_profiles.objective_groups: string[])
-  try {
-    const { data: prof } = await supabase
-      .from('user_profiles')
-      .select('objective_groups')
-      .eq('user_id', uid)
-      .maybeSingle();
-    const slugs = Array.isArray(prof?.objective_groups)
-      ? (prof!.objective_groups as string[]).map(String).filter(Boolean)
-      : [];
-    if (slugs.length) return { slugs, source: 'user_profiles' };
-  } catch {}
-
-  // 3) fallback historique: user_objective -> objective_tag -> group_slug
-  try {
-    const { data: objs } = await supabase
-      .from('user_objective')
-      .select('objective_slug')
-      .eq('user_id', uid);
-    const tagSlugs = (objs || []).map((r: any) => String(r.objective_slug)).filter(Boolean);
-    if (tagSlugs.length) {
-      const { data: tagRows } = await supabase
-        .from('objective_tag')
-        .select('slug, group_slug')
-        .in('slug', tagSlugs);
-
-      const slugs = Array.from(new Set((tagRows || []).map(t => String(t.group_slug)).filter(Boolean)));
-      if (slugs.length) return { slugs, source: 'objective_tag_fallback' };
-    }
-  } catch {}
-
-  return { slugs: [], source: 'none' };
 }

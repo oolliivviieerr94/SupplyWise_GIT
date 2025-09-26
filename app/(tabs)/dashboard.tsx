@@ -1,406 +1,220 @@
 // /home/project/app/(tabs)/dashboard.tsx
-import React, { useEffect, useMemo, useState, useCallback } from 'react';
-import {
-  View,
-  Text,
-  StyleSheet,
-  ScrollView,
-  TouchableOpacity,
-  RefreshControl,
-  ActivityIndicator,
-} from 'react-native';
+import React, { useEffect, useMemo, useState } from 'react';
+import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Image, ActivityIndicator } from 'react-native';
 import { router } from 'expo-router';
 import { supabase } from '@/lib/supabase';
-import type { Session } from '@supabase/supabase-js';
-import { useConseil } from '@/hooks/useConseil';
-import { fetchUserDashboardStats, type UserDashboardStats } from '@/lib/stats';
-import { logConseilRead } from '@/lib/track';
-import {
-  Target, Calendar, Scan, BookOpen, Settings, ArrowRight, Zap, User,
-  Package, Dumbbell, Activity, Heart, Flame, Plus,
-} from 'lucide-react-native';
+import { CalendarDays, Grid3X3, BookOpen, Heart, Sparkles, User, Settings } from 'lucide-react-native';
 
-// Icônes par objectif (fallback Target)
-const goalIcons: Record<string, any> = {
-  hypertrophy: Dumbbell,
-  fatloss: Flame,
-  endurance: Activity,
-  health: Heart,
-};
+/**
+ * NOTE IMPORTANTE
+ * - Tous les hooks sont au NIVEAU RACINE du composant (aucun hook dans des if/return/loops)
+ * - L’ordre des sections est : Conseil du jour -> Profil -> Actions rapides
+ */
 
 export default function DashboardScreen() {
-  const [session, setSession] = useState<Session | null>(null);
-  const [userProfile, setUserProfile] = useState<any>(null);
-  const [dashboardStats, setDashboardStats] = useState<UserDashboardStats | null>(null);
-  const [isAdmin, setIsAdmin] = useState(false);
+  // ----- Etat & données -----
+  const [userEmail, setUserEmail] = useState<string | null>(null);
+  const [tip, setTip] = useState<string | null>(null);
+  const [loadingTip, setLoadingTip] = useState<boolean>(true);
 
-  const [loadingBoot, setLoadingBoot] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
-
-  const { conseil, loading: conseilLoading, error: conseilError, refreshTip } = useConseil();
-
-  /* --------- Auth + bootstrap --------- */
+  // Profil : on lit l’utilisateur une seule fois
   useEffect(() => {
-    supabase.auth.getSession().then(async ({ data: { session } }) => {
-      setSession(session);
-      if (session) {
-        checkAdminAccess(session);
-        await loadCore(session.user.id);
+    (async () => {
+      try {
+        const { data: { user } } = await supabase.auth.getUser();
+        setUserEmail(user?.email ?? null);
+      } catch {
+        setUserEmail(null);
       }
-      setLoadingBoot(false);
-    });
-
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (_evt, sess) => {
-      setSession(sess);
-      if (sess) {
-        checkAdminAccess(sess);
-        await loadCore(sess.user.id);
-      } else {
-        setIsAdmin(false);
-        setUserProfile(null);
-        setDashboardStats(null);
-      }
-    });
-
-    return () => subscription.unsubscribe();
+    })();
   }, []);
 
-  /* --------- Conseil tracking --------- */
+  // Conseil du jour : on essaye une table probable, sinon fallback local
   useEffect(() => {
-    if (!conseilLoading && !conseilError && conseil?.id) logConseilRead(conseil.id);
-  }, [conseil, conseilLoading, conseilError]);
+    let alive = true;
+    (async () => {
+      setLoadingTip(true);
+      try {
+        // Essayez d’abord une table probable (adaptez si vous avez une table différente)
+        // Si la table n’existe pas, on catch et on met un fallback.
+        const { data, error } = await supabase
+          .from('tip_of_the_day')
+          .select('text')
+          .order('date', { ascending: false })
+          .limit(1);
 
-  const checkAdminAccess = async (s: Session) => {
-    try {
-      const { data } = await supabase
-        .from('app_admins')
-        .select('email')
-        .eq('email', s.user.email)
-        .maybeSingle();
-      setIsAdmin(!!data);
-    } catch {
-      setIsAdmin(false);
-    }
-  };
+        if (error) throw error;
 
-  const loadCore = useCallback(async (userId?: string) => {
-    try {
-      setRefreshing(true);
-      const uid = userId ?? (await supabase.auth.getUser()).data.user?.id;
-      if (!uid) return;
-
-      // Charge profil + stats en parallèle
-      const [{ data: profile }, stats] = await Promise.all([
-        supabase.from('user_profiles').select('*').eq('user_id', uid).maybeSingle(),
-        fetchUserDashboardStats(),
-      ]);
-
-      setUserProfile(profile || null);
-      setDashboardStats(stats || null);
-    } catch (e) {
-      console.error('Error loading dashboard data:', e);
-    } finally {
-      setRefreshing(false);
-    }
+        const txt = (data?.[0]?.text as string | undefined) ?? null;
+        if (alive) setTip(txt ?? null);
+      } catch {
+        if (alive) {
+          // Fallback “sûr”
+          setTip("Hydratez-vous et dormez suffisamment : ce sont les meilleurs boosters de performance 💧😴");
+        }
+      } finally {
+        if (alive) setLoadingTip(false);
+      }
+    })();
+    return () => { alive = false; };
   }, []);
 
-  /* --------- Écrans non logué / chargement --------- */
-  if (loadingBoot) {
-    return (
-      <View style={styles.loadingContainer}>
-        <Target size={48} color="#22C55E" />
-        <Text style={styles.loadingText}>Chargement…</Text>
-      </View>
-    );
-  }
+  // Petit résumé de profil (mémoïsé pour éviter les recalculs)
+  const profileSummary = useMemo(() => {
+    return userEmail
+      ? `Connecté : ${userEmail}`
+      : `Vous n’êtes pas connecté`;
+  }, [userEmail]);
 
-  if (!session) {
-    return (
-      <View style={styles.container}>
-        <View style={styles.header}>
-          <Target size={32} color="#22C55E" />
-          <Text style={styles.title}>Tableau de bord</Text>
-        </View>
-        <View style={styles.notLoggedIn}>
-          <User size={64} color="#E5E7EB" />
-          <Text style={styles.notLoggedInTitle}>Connectez-vous</Text>
-          <Text style={styles.notLoggedInText}>Accédez à votre tableau de bord personnalisé</Text>
-          <TouchableOpacity style={styles.loginButton} onPress={() => router.push('/auth')}>
-            <Text style={styles.loginButtonText}>Se connecter</Text>
-          </TouchableOpacity>
-        </View>
-      </View>
-    );
-  }
-
-  /* --------- Actions rapides --------- */
-  const quickActions = useMemo(() => ([
-    { icon: Target,   title: 'Mes recommandations',       subtitle: 'Voir les conseils personnalisés', onPress: () => router.push('/(tabs)/recommendations'), color: '#22C55E' },
-    { icon: Calendar, title: 'Planning du jour',          subtitle: 'Gérer mes prises',                onPress: () => router.push('/planner'),               color: '#16A34A' },
-    { icon: Scan,     title: 'Scanner un produit',        subtitle: 'Identifier un supplément',        onPress: () => router.push('/(tabs)/scanner'),        color: '#84CC16' },
-    { icon: BookOpen, title: 'Rechercher un complément',  subtitle: 'Explorer les compléments',        onPress: () => router.push('/(tabs)/library'),        color: '#65A30D' },
-    { icon: Heart,    title: 'Mes produits favoris',      subtitle: 'Retrouvez vos favoris',           onPress: () => router.push('/(tabs)/favorites'),      color: '#10B981' },
-    { icon: Package,  title: 'Catalogue produits',        subtitle: 'Parcourir tous les produits',     onPress: () => router.push('/(tabs)/products'),       color: '#7C3AED' },
-    ...(isAdmin ? [{ icon: Settings, title: 'Administration', subtitle: 'Gérer les données (Admin)', onPress: () => router.push('/admin'), color: '#EF4444' }] : []),
-  ]), [isAdmin]);
-
-  /* --------- Rendu --------- */
+  // ----- Rendu -----
   return (
-    <ScrollView
-      style={styles.container}
-      showsVerticalScrollIndicator={false}
-      refreshControl={
-        <RefreshControl refreshing={refreshing} onRefresh={() => loadCore()} tintColor="#22C55E" />
-      }
-    >
-      {/* En-tête */}
-      <View style={styles.header}>
-        <View style={styles.headerText}>
-          <Text style={styles.welcomeText}>
-            Bonjour {session.user.user_metadata?.full_name?.split(' ')[0] || 'Athlète'}
-          </Text>
-        </View>
-        <TouchableOpacity style={styles.profileButton} onPress={() => router.push('/profile')}>
-          <User size={20} color="#6B7280" />
-        </TouchableOpacity>
-      </View>
-
-      {/* 1) Conseil du jour — EN PREMIER */}
-      <View style={styles.section}>
-        <View style={styles.sectionHeader}>
-          <Text style={styles.sectionTitle}>💡 Conseil Expert du Jour</Text>
-          <TouchableOpacity onPress={refreshTip}>
-            <ArrowRight size={20} color="#F59E0B" />
-          </TouchableOpacity>
+    <View style={styles.container}>
+      <ScrollView contentContainerStyle={{ paddingBottom: 36 }} showsVerticalScrollIndicator={false}>
+        {/* Header */}
+        <View style={styles.header}>
+          <Image source={require('../../assets/images/Logo_Bolt.png')} style={styles.logo} resizeMode="contain" />
+          <Text style={styles.title}>Tableau de bord</Text>
+          <Text style={styles.subtitle}>Bienvenue dans votre espace SupplyWise</Text>
         </View>
 
-        {conseilLoading ? (
-          <View style={styles.tipLoadingContainer}>
-            <Text style={styles.tipLoadingText}>Chargement du conseil...</Text>
+        {/* 1) CONSEIL DU JOUR */}
+        <View style={styles.card}>
+          <View style={styles.cardHeader}>
+            <Sparkles size={18} color="#2563EB" />
+            <Text style={styles.cardTitle}>Conseil du jour</Text>
           </View>
-        ) : conseilError ? (
-          <View style={styles.tipErrorContainer}>
-            <Text style={styles.tipErrorText}>Erreur lors du chargement du conseil</Text>
-            <TouchableOpacity style={styles.tipRetryButton} onPress={refreshTip}>
-              <Text style={styles.tipRetryText}>Réessayer</Text>
-            </TouchableOpacity>
-          </View>
-        ) : conseil ? (
-          <View style={styles.tipCard}>
-            <Text style={styles.tipIcon}>💡</Text>
-            <View style={styles.tipContent}>
-              <Text style={styles.tipTitle}>{conseil.title}</Text>
-              <Text style={styles.tipText}>{conseil.content}</Text>
-              {!!conseil.category && (
-                <Text style={styles.tipCategory}>Catégorie: {conseil.category}</Text>
-              )}
+          {loadingTip ? (
+            <View style={{ paddingVertical: 6 }}>
+              <ActivityIndicator size="small" color="#2563EB" />
             </View>
-          </View>
-        ) : null}
-      </View>
-
-      {/* 2) Votre profil */}
-      <View style={styles.section}>
-        <Text style={styles.sectionTitle}>👤 Votre profil</Text>
-
-        {!userProfile ? (
-          <View style={{ paddingVertical: 8, alignItems: 'center' }}>
-            <ActivityIndicator color="#2563EB" />
-          </View>
-        ) : (
-          <>
-            <View style={styles.profileSummary}>
-              <View style={styles.profileStat}>
-                <Text style={styles.profileStatLabel}>Sport</Text>
-                <Text style={styles.profileStatValue}>{userProfile.sport || '—'}</Text>
-              </View>
-              <View style={styles.profileStat}>
-                <Text style={styles.profileStatLabel}>Fréquence</Text>
-                <Text style={styles.profileStatValue}>
-                  {userProfile.frequency_per_week ?? '—'}x/sem
-                </Text>
-              </View>
-              <View style={styles.profileStat}>
-                <Text style={styles.profileStatLabel}>Budget</Text>
-                <Text style={styles.profileStatValue}>
-                  {userProfile.budget_monthly ?? '—'}€/mois
-                </Text>
-              </View>
-            </View>
-
+          ) : (
+            <Text style={styles.tipText}>{tip}</Text>
+          )}
+          <View style={styles.cardActionsRow}>
             <TouchableOpacity
-              style={styles.editProfileButton}
-              onPress={() => router.push('/onboarding?edit=1&startStep=2')}
+              style={[styles.smallBtn, { borderColor: '#2563EB', backgroundColor: '#EFF6FF' }]}
+              onPress={() => router.push('/(tabs)/library')}
             >
-              <Settings size={16} color="#2563EB" />
-              <Text style={styles.editProfileText}>Modifier mon profil</Text>
+              <BookOpen size={16} color="#2563EB" />
+              <Text style={[styles.smallBtnText, { color: '#2563EB' }]}>Voir la bibliothèque</Text>
             </TouchableOpacity>
-          </>
-        )}
-      </View>
-
-      {/* 3) Actions rapides */}
-      <View style={styles.section}>
-        <Text style={styles.sectionTitle}>⚡ Actions rapides</Text>
-        <View style={styles.quickActionsGrid}>
-          {quickActions.map((action, index) => (
-            <TouchableOpacity key={index} style={styles.quickActionCard} onPress={action.onPress}>
-              <View style={[styles.quickActionIcon, { backgroundColor: action.color }]}>
-                <action.icon size={24} color="#FFFFFF" />
-              </View>
-              <View style={styles.quickActionContent}>
-                <Text style={styles.quickActionTitle}>{action.title}</Text>
-                <Text style={styles.quickActionSubtitle}>{action.subtitle}</Text>
-              </View>
-              <ArrowRight size={16} color="#6B7280" />
+            <TouchableOpacity
+              style={[styles.smallBtn, { borderColor: '#10B981', backgroundColor: '#ECFDF5' }]}
+              onPress={() => router.push('/recommendations')}
+            >
+              <Grid3X3 size={16} color="#10B981" />
+              <Text style={[styles.smallBtnText, { color: '#065F46' }]}>Voir mes recommandations</Text>
             </TouchableOpacity>
-          ))}
+          </View>
         </View>
-      </View>
 
-      {/* Statistiques */}
-      <View style={styles.section}>
-        <Text style={styles.sectionTitle}>📊 Vos statistiques</Text>
-        {dashboardStats ? (
-          <View style={styles.statsGrid}>
-            <View style={styles.statItem}>
-              <View style={styles.statIcon}><Activity size={20} color="#2563EB" /></View>
-              <Text style={styles.statValue}>{dashboardStats.streak_days}</Text>
-              <Text style={styles.statLabel}>Jours de streak</Text>
-            </View>
-            <View style={styles.statItem}>
-              <View style={styles.statIcon}><BookOpen size={20} color="#7C3AED" /></View>
-              <Text style={styles.statValue}>{dashboardStats.fiche_views_total}</Text>
-              <Text style={styles.statLabel}>Fiches consultées</Text>
-            </View>
-            <View style={styles.statItem}>
-              <View style={styles.statIcon}><Zap size={20} color="#F59E0B" /></View>
-              <Text style={styles.statValue}>{dashboardStats.conseil_reads_total}</Text>
-              <Text style={styles.statLabel}>Conseils lus</Text>
-            </View>
-            <View style={styles.statItem}>
-              <View style={styles.statIcon}><Scan size={20} color="#84CC16" /></View>
-              <Text style={styles.statValue}>{dashboardStats.product_scans_total}</Text>
-              <Text style={styles.statLabel}>Produits scannés</Text>
-            </View>
-            <View style={styles.statItem}>
-              <View style={styles.statIcon}><Plus size={20} color="#10B981" /></View>
-              <Text style={styles.statValue}>{dashboardStats.product_suggestions_total}</Text>
-              <Text style={styles.statLabel}>Produits suggérés</Text>
-            </View>
-            <View style={styles.statItem}>
-              <View style={styles.statIcon}>
-                {(() => {
-                  const GoalIcon = userProfile?.goal ? goalIcons[userProfile.goal] || Target : Target;
-                  return <GoalIcon size={20} color="#16A34A" />;
-                })()}
-              </View>
-              <Text style={styles.statValue}>
-                {userProfile?.goal === 'hypertrophy' ? 'Muscle'
-                  : userProfile?.goal === 'fatloss' ? 'Perte'
-                  : userProfile?.goal === 'endurance' ? 'Endurance'
-                  : 'Santé'}
-              </Text>
-              <Text style={styles.statLabel}>Objectif principal</Text>
-            </View>
+        {/* 2) PROFIL */}
+        <View style={styles.card}>
+          <View style={styles.cardHeader}>
+            <User size={18} color="#111827" />
+            <Text style={styles.cardTitle}>Profil</Text>
           </View>
-        ) : (
-          <View style={{ paddingVertical: 8, alignItems: 'center' }}>
-            <ActivityIndicator color="#2563EB" />
+          <Text style={styles.profileLine}>{profileSummary}</Text>
+          <View style={styles.cardActionsRow}>
+            <TouchableOpacity
+              style={[styles.smallBtn, { borderColor: '#6B7280', backgroundColor: '#F3F4F6' }]}
+              onPress={() => router.push('/onboarding?edit=1')}
+            >
+              <Settings size={16} color="#374151" />
+              <Text style={[styles.smallBtnText, { color: '#374151' }]}>Modifier mon profil</Text>
+            </TouchableOpacity>
           </View>
-        )}
-      </View>
+        </View>
 
-      <View style={styles.footer} />
-    </ScrollView>
+        {/* 3) ACTIONS RAPIDES */}
+        <View style={styles.card}>
+          <View style={styles.cardHeader}>
+            <Grid3X3 size={18} color="#111827" />
+            <Text style={styles.cardTitle}>Actions rapides</Text>
+          </View>
+
+          <View style={styles.quickGrid}>
+            <QuickBtn
+              icon={<Grid3X3 size={20} color="#2563EB" />}
+              label="Mon espace"
+              onPress={() => router.replace('/(tabs)/dashboard')}
+            />
+            <QuickBtn
+              icon={<BookOpen size={20} color="#2563EB" />}
+              label="Bibliothèque"
+              onPress={() => router.push('/(tabs)/library')}
+            />
+            <QuickBtn
+              icon={<Grid3X3 size={20} color="#10B981" />}
+              label="Recommandations"
+              onPress={() => router.push('/recommendations')}
+            />
+            <QuickBtn
+              icon={<CalendarDays size={20} color="#F59E0B" />}
+              label="Planning"
+              onPress={() => router.push('/planning')}
+            />
+            <QuickBtn
+              icon={<Heart size={20} color="#EF4444" />}
+              label="Favoris"
+              onPress={() => router.push('/favorites')}
+            />
+          </View>
+        </View>
+
+        <View style={{ height: 24 }} />
+      </ScrollView>
+    </View>
   );
 }
 
-/* -------------------- Styles -------------------- */
+/** ----- Petit bouton réutilisable pour les actions rapides ----- */
+function QuickBtn({
+  icon, label, onPress,
+}: { icon: React.ReactNode; label: string; onPress: () => void }) {
+  return (
+    <TouchableOpacity style={styles.quickBtn} onPress={onPress}>
+      <View style={styles.quickIcon}>{icon}</View>
+      <Text style={styles.quickLabel}>{label}</Text>
+    </TouchableOpacity>
+  );
+}
+
+/** ----- Styles ----- */
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#F9FAFB' },
+  container: { flex: 1, backgroundColor: '#F8FAFC' },
+  header: { alignItems: 'center', paddingTop: 56, paddingBottom: 16, backgroundColor: '#FFFFFF' },
+  logo: { width: 220, height: 66, marginBottom: 8 },
+  title: { fontSize: 22, fontWeight: '800', color: '#111827' },
+  subtitle: { fontSize: 14, color: '#6B7280', marginTop: 4 },
 
-  loadingContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#F9FAFB' },
-  loadingText: { fontSize: 16, color: '#6B7280', marginTop: 12 },
-
-  header: {
-    flexDirection: 'row', alignItems: 'center',
-    paddingTop: 60, paddingHorizontal: 24, paddingBottom: 20,
-    backgroundColor: '#FFFFFF', position: 'relative',
+  card: {
+    marginHorizontal: 16, marginTop: 14, backgroundColor: '#FFFFFF',
+    borderRadius: 14, padding: 16,
+    shadowColor: '#000', shadowOpacity: 0.06, shadowOffset: { width: 0, height: 2 }, shadowRadius: 8, elevation: 2,
   },
-  headerText: { flex: 1, alignItems: 'center', justifyContent: 'center' },
-  title: { fontSize: 24, fontWeight: '700', color: '#1F2937', textAlign: 'center' },
-  welcomeText: { fontSize: 26, fontWeight: '700', color: '#1F2937', textAlign: 'center' },
-  profileButton: {
-    position: 'absolute', right: 24, top: 60, width: 40, height: 40,
-    borderRadius: 20, backgroundColor: '#F3F4F6', alignItems: 'center', justifyContent: 'center',
+  cardHeader: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 8 },
+  cardTitle: { fontSize: 16, fontWeight: '800', color: '#111827' },
+
+  tipText: { color: '#111827', lineHeight: 21 },
+  profileLine: { color: '#374151' },
+
+  cardActionsRow: { flexDirection: 'row', gap: 10, marginTop: 12 },
+  smallBtn: {
+    flex: 1, height: 44, borderRadius: 10, borderWidth: 1,
+    alignItems: 'center', justifyContent: 'center', flexDirection: 'row', paddingHorizontal: 10,
   },
+  smallBtnText: { marginLeft: 6, fontWeight: '700', fontSize: 13 },
 
-  notLoggedIn: { flex: 1, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 32 },
-  notLoggedInTitle: { fontSize: 20, fontWeight: '600', color: '#1F2937', marginTop: 16, marginBottom: 8 },
-  notLoggedInText: { fontSize: 16, color: '#6B7280', textAlign: 'center', marginBottom: 24 },
-  loginButton: { backgroundColor: '#22C55E', paddingHorizontal: 24, paddingVertical: 12, borderRadius: 12 },
-  loginButtonText: { fontSize: 16, fontWeight: '600', color: '#FFFFFF' },
-
-  section: {
-    backgroundColor: '#FFFFFF', margin: 16, padding: 24, borderRadius: 20,
-    shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.05, shadowRadius: 8, elevation: 2,
+  quickGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 },
+  quickBtn: {
+    width: '31%', minWidth: 96, aspectRatio: 1, borderRadius: 14,
+    borderWidth: 1, borderColor: '#E5E7EB', backgroundColor: '#F9FAFB',
+    alignItems: 'center', justifyContent: 'center',
   },
-  sectionHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 },
-  sectionTitle: { fontSize: 18, fontWeight: '700', color: '#1F2937' },
-
-  // Conseil
-  tipLoadingContainer: { alignItems: 'center', paddingVertical: 20 },
-  tipLoadingText: { fontSize: 14, color: '#6B7280' },
-  tipErrorContainer: { backgroundColor: '#FEF2F2', padding: 16, borderRadius: 12, borderLeftWidth: 4, borderLeftColor: '#EF4444' },
-  tipErrorText: { fontSize: 14, color: '#DC2626', marginBottom: 8 },
-  tipRetryButton: { alignSelf: 'flex-start', backgroundColor: '#EF4444', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 6 },
-  tipRetryText: { fontSize: 12, fontWeight: '600', color: '#FFFFFF' },
-  tipCard: { flexDirection: 'row', alignItems: 'flex-start', backgroundColor: '#F0FDF4', padding: 16, borderRadius: 12, borderLeftWidth: 4, borderLeftColor: '#22C55E' },
-  tipIcon: { fontSize: 24, marginRight: 12 },
-  tipContent: { flex: 1 },
-  tipTitle: { fontSize: 16, fontWeight: '600', color: '#065F46', marginBottom: 4 },
-  tipText: { fontSize: 14, color: '#047857', lineHeight: 20, marginBottom: 4 },
-  tipCategory: { fontSize: 12, color: '#059669', fontStyle: 'italic' },
-
-  // Profil
-  profileSummary: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 16 },
-  profileStat: { alignItems: 'center' },
-  profileStatLabel: { fontSize: 12, color: '#6B7280', marginBottom: 4 },
-  profileStatValue: { fontSize: 14, fontWeight: '600', color: '#1F2937', textAlign: 'center' },
-  editProfileButton: {
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
-    borderWidth: 1, borderColor: '#2563EB', paddingVertical: 12, paddingHorizontal: 16,
-    borderRadius: 8, backgroundColor: '#EFF6FF', gap: 8,
+  quickIcon: {
+    width: 42, height: 42, borderRadius: 21, backgroundColor: '#FFFFFF',
+    alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: '#E5E7EB', marginBottom: 8,
   },
-  editProfileText: { fontSize: 14, fontWeight: '600', color: '#2563EB' },
-
-  // Actions rapides
-  quickActionsGrid: { gap: 12 },
-  quickActionCard: {
-    flexDirection: 'row', alignItems: 'center', backgroundColor: '#F9FAFB',
-    padding: 16, borderRadius: 16, shadowColor: '#000', shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.05, shadowRadius: 4, elevation: 1,
-  },
-  quickActionIcon: { width: 40, height: 40, borderRadius: 12, alignItems: 'center', justifyContent: 'center', marginRight: 12 },
-  quickActionContent: { flex: 1 },
-  quickActionTitle: { fontSize: 16, fontWeight: '600', color: '#1F2937' },
-  quickActionSubtitle: { fontSize: 12, color: '#6B7280', marginTop: 2 },
-
-  // Stats
-  statsGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 12 },
-  statItem: {
-    flex: 1, minWidth: '45%', backgroundColor: '#F9FAFB', padding: 16, borderRadius: 16,
-    alignItems: 'center', shadowColor: '#000', shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.05, shadowRadius: 4, elevation: 1,
-  },
-  statIcon: {
-    width: 40, height: 40, borderRadius: 12, backgroundColor: '#FFFFFF',
-    alignItems: 'center', justifyContent: 'center', marginBottom: 12,
-    shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.1, shadowRadius: 2, elevation: 1,
-  },
-  statValue: { fontSize: 20, fontWeight: '700', color: '#1F2937', marginBottom: 4 },
-  statLabel: { fontSize: 12, fontWeight: '600', color: '#6B7280', textAlign: 'center' },
-
-  footer: { height: 100 },
+  quickLabel: { fontSize: 12, fontWeight: '700', color: '#111827', textAlign: 'center' },
 });

@@ -7,12 +7,8 @@ import { router } from 'expo-router';
 import { supabase } from '@/lib/supabase';
 import { listObjectiveGroups, type ObjectiveGroup } from '@/lib/queries';
 import ProductSuggestionModal from '@/components/ProductSuggestionModal';
-import { Search, Filter, X, ArrowLeft, Star, FileText, Heart, Award, Clock, Euro } from 'lucide-react-native';
+import { Search, Filter, X, ArrowLeft, Star, FileText, Heart } from 'lucide-react-native';
 
-import { useFiches } from '@/hooks/useFiches';
-import { enrichSupplementForDisplay } from '@/lib/supplementDisplayUtils';
-
-/** ---------- Types DB de base ---------- */
 type Supplement = {
   id: string;
   slug: string;
@@ -25,25 +21,6 @@ type Supplement = {
   scores: Record<string, number> | null;
   objective_groups?: string[];
   has_vegan_tag?: boolean;
-};
-
-/** Infos dérivées à afficher sur la carte */
-type SupplementDisplay = Supplement & {
-  _dosage: string;
-  _timing: string;
-  _evidence: 'A' | 'B' | 'C';
-  _costPerDay: number;
-};
-
-const evidenceColors: Record<'A' | 'B' | 'C', string> = {
-  A: '#10B981',
-  B: '#F59E0B',
-  C: '#EF4444',
-};
-const evidenceLabels: Record<'A' | 'B' | 'C', string> = {
-  A: 'Preuve Forte',
-  B: 'Preuve Modérée',
-  C: 'Preuve Limitée',
 };
 
 type FavCol = 'supplement_id' | 'supplement' | 'supplement_slug';
@@ -63,8 +40,8 @@ async function detectFavoritesColumn(): Promise<FavCol> {
 }
 
 export default function LibraryScreen() {
-  const [supplements, setSupplements] = useState<SupplementDisplay[]>([]);
-  const [filteredSupplements, setFilteredSupplements] = useState<SupplementDisplay[]>([]);
+  const [supplements, setSupplements] = useState<Supplement[]>([]);
+  const [filteredSupplements, setFilteredSupplements] = useState<Supplement[]>([]);
   const [objectiveGroups, setObjectiveGroups] = useState<ObjectiveGroup[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -76,9 +53,6 @@ export default function LibraryScreen() {
     vegan: false, minScore: 0, maxPrice: 1000, qualityLevel: '',
     sortBy: 'score_global', sortOrder: 'desc',
   });
-
-  // Fiches Markdown (slug -> contenu); utilisé pour enrichir dosage/timing si manquant
-  const { data: ficheMap } = useFiches();
 
   // Favoris (compat colonne)
   const [favCol, setFavCol] = useState<FavCol>('supplement_id');
@@ -102,15 +76,6 @@ export default function LibraryScreen() {
     })();
   }, []);
 
-  // re-enrichit si les fiches arrivent après coup
-  useEffect(() => {
-    if (!supplements.length) return;
-    setSupplements(prev => prev.map(s => {
-      const enrich = enrichSupplementForDisplay(s as Supplement, ficheMap as any);
-      return { ...s, _dosage: enrich.dosage, _timing: enrich.timing, _evidence: enrich.evidence, _costPerDay: enrich.costPerDay };
-    }));
-  }, [ficheMap]);
-
   useEffect(() => { filterAndSortSupplements(); }, [supplements, searchQuery, filters]);
 
   const loadSupplements = async () => {
@@ -128,52 +93,25 @@ export default function LibraryScreen() {
       const supplementsWithTags = await Promise.all(
         (supplementsData || []).map(async (s) => {
           try {
-            // Désambiguïsation du JOIN objective_tag (évite l’erreur 300)
             const { data: tags } = await supabase
               .from('supplement_objective_tag')
-              .select(`
-                tag_slug,
-                objective_tag:objective_tag!supplement_objective_tag_tag_slug_fkey (slug,label,group_slug)
-              `)
+              .select(`tag_slug, objective_tag:objective_tag!fk_sot_objective_tag(slug,label,group_slug)`)
               .eq('supplement_id', s.id);
 
             const objective_groups = Array.from(new Set(
-              (tags || [])
-                .map((t: any) => t.objective_tag?.group_slug)
-                .filter(Boolean)
+              tags?.map((t: any) => t.objective_tag?.group_slug).filter(Boolean) || []
             ));
 
             const has_vegan_tag = (tags || []).some((t: any) => {
-              const slug = (t.tag_slug || '').toLowerCase();
-              const label = (t.objective_tag?.label || '').toLowerCase();
-              return slug.includes('vegan') || slug.includes('vegetar') || slug.includes('vegetal') ||
-                     label.includes('vegan') || label.includes('végétar') || label.includes('végétal');
+              const slug = (t.tag_slug ?? '').toLowerCase();
+              const label = (t.objective_tag?.label ?? '').toLowerCase();
+              return slug.includes('vegan') || slug.includes('vegetar') || slug.includes('vegetal')
+                  || label.includes('vegan') || label.includes('végétar') || label.includes('végétal');
             });
 
-            // Enrichissement (DB → fiche Markdown en fallback)
-            const enrich = enrichSupplementForDisplay(s as Supplement, ficheMap as any);
-
-            const display: SupplementDisplay = {
-              ...s,
-              objective_groups,
-              has_vegan_tag,
-              _dosage: enrich.dosage,
-              _timing: enrich.timing,
-              _evidence: enrich.evidence,
-              _costPerDay: enrich.costPerDay,
-            };
-            return display;
+            return { ...s, objective_groups, has_vegan_tag };
           } catch {
-            const enrich = enrichSupplementForDisplay(s as Supplement, ficheMap as any);
-            return {
-              ...s,
-              objective_groups: [],
-              has_vegan_tag: false,
-              _dosage: enrich.dosage,
-              _timing: enrich.timing,
-              _evidence: enrich.evidence,
-              _costPerDay: enrich.costPerDay,
-            } as SupplementDisplay;
+            return { ...s, objective_groups: [], has_vegan_tag: false };
           }
         })
       );
@@ -212,7 +150,7 @@ export default function LibraryScreen() {
     if (filters.qualityLevel && filters.qualityLevel !== 'Tous') filtered = filtered.filter(s => s.quality_level === filters.qualityLevel);
 
     filtered.sort((a, b) => {
-      const by = filters.sortBy as keyof SupplementDisplay | 'name';
+      const by = filters.sortBy;
       const order = filters.sortOrder === 'asc' ? 1 : -1;
       const av = (by === 'name') ? a.name : (a as any)[by] || 0;
       const bv = (by === 'name') ? b.name : (b as any)[by] || 0;
@@ -223,10 +161,10 @@ export default function LibraryScreen() {
     setFilteredSupplements(filtered);
   };
 
-  const handleSupplementPress = (s: SupplementDisplay) =>
+  const handleSupplementPress = (s: Supplement) =>
     router.push({ pathname: '/supplement-detail', params: { slug: s.slug } });
 
-  const handleViewFiche = (s: SupplementDisplay) =>
+  const handleViewFiche = (s: Supplement) =>
     router.push({ pathname: '/fiche-produit', params: { slug: s.slug } });
 
   const resetFilters = () => {
@@ -241,7 +179,7 @@ export default function LibraryScreen() {
 
   // ---------- Favoris ----------
   const isIdCol = favCol === 'supplement_id' || favCol === 'supplement';
-  const isFav = (s: SupplementDisplay) => favoriteKeys.has(String(isIdCol ? s.id : s.slug));
+  const isFav = (s: Supplement) => favoriteKeys.has(String(isIdCol ? s.id : s.slug));
 
   const ensureFavCol = async () => {
     if (favReady) return favColRef.current;
@@ -252,7 +190,7 @@ export default function LibraryScreen() {
     return col;
   };
 
-  const toggleFavorite = async (s: SupplementDisplay) => {
+  const toggleFavorite = async (s: Supplement) => {
     const col = await ensureFavCol();
     const idBased = col === 'supplement_id' || col === 'supplement';
 
@@ -336,7 +274,6 @@ export default function LibraryScreen() {
       <ScrollView style={styles.content} showsVerticalScrollIndicator={false}>
         {filteredSupplements.map((s) => {
           const fav = isFav(s);
-          const costDay = s._costPerDay.toFixed(2);
           return (
             <TouchableOpacity key={s.id} style={styles.supplementCard} onPress={() => handleSupplementPress(s)}>
               <View style={styles.supplementHeader}>
@@ -346,30 +283,33 @@ export default function LibraryScreen() {
                 </View>
 
                 <View style={styles.supplementMeta}>
-                  {s.score_global != null && (
+                  {s.score_global && (
                     <View style={styles.scoreContainer}>
                       <Star size={16} color="#F59E0B" fill="#F59E0B" />
-                      <Text style={styles.scoreText}>{s.score_global.toFixed(1)}/20</Text>
+                      <Text style={styles.scoreText}>{s.score_global}/20</Text>
                     </View>
                   )}
-                  {s.research_count != null && (
+                  {s.research_count && (
                     <Text style={styles.researchCount}>
                       {s.research_count} étude{s.research_count > 1 ? 's' : ''}
                     </Text>
                   )}
-                  {/* Badge de preuve */}
-                  <View style={[styles.evidenceBadge, { backgroundColor: evidenceColors[s._evidence] }]}>
-                    <Award size={12} color="#fff" />
-                    <Text style={styles.evidenceText}>{evidenceLabels[s._evidence]}</Text>
-                  </View>
                 </View>
               </View>
 
-              {/* Infos dérivées harmonisées */}
-              <View style={styles.supplementDerived}>
-                <Text style={styles.derivLine}><Text style={styles.derivLabel}>Dosage : </Text>{s._dosage}</Text>
-                <Text style={styles.derivLine}><Clock size={14} color="#6B7280" /> <Text style={styles.derivLabel}>Timing : </Text>{s._timing}</Text>
-                <Text style={styles.derivLine}><Euro size={14} color="#6B7280" /> <Text style={styles.derivLabel}>Coût/jour : </Text>{costDay}€</Text>
+              <View style={styles.supplementDetails}>
+                {s.price_eur_month && (
+                  <View style={styles.detailItem}>
+                    <Text style={styles.detailLabel}>Prix/mois:</Text>
+                    <Text style={styles.detailValue}>{s.price_eur_month}€</Text>
+                  </View>
+                )}
+                {s.quality_level && (
+                  <View style={styles.detailItem}>
+                    <Text style={styles.detailLabel}>Qualité:</Text>
+                    <Text style={styles.detailValue}>{s.quality_level}</Text>
+                  </View>
+                )}
               </View>
 
               <View style={styles.supplementActions}>
@@ -389,7 +329,6 @@ export default function LibraryScreen() {
                 </TouchableOpacity>
               </View>
 
-              {/* Scores détaillés si présents */}
               {s.scores && Object.keys(s.scores).length > 0 && (
                 <View style={styles.scoresContainer}>
                   {Object.entries(s.scores).map(([k, v]) => (
@@ -420,7 +359,7 @@ export default function LibraryScreen() {
         <View style={styles.footer} />
       </ScrollView>
 
-      {/* ---- Modal Filtres & tri ---- */}
+      {/* ---- Modal Filtres ---- */}
       <Modal visible={showFilters} animationType="slide" presentationStyle="pageSheet">
         <View style={styles.modalContainer}>
           <View style={styles.modalHeader}>
@@ -445,7 +384,8 @@ export default function LibraryScreen() {
                           : [...filters.objectiveGroups, group.slug];
                         setFilters({ ...filters, objectiveGroups: newGroups });
                       }}>
-                      {group.emoji && (<Text style={styles.objectiveEmoji}>{group.emoji}</Text>)}
+                      {/* Fallback icône si emoji manquant */}
+                      <Text style={styles.objectiveEmoji}>{group.emoji ?? '🎯'}</Text>
                       <Text style={[styles.objectiveButtonText, isSelected && styles.objectiveButtonTextActive]}>
                         {group.label}
                       </Text>
@@ -623,13 +563,6 @@ const styles = StyleSheet.create({
   scoreText: { fontSize: 16, fontWeight: '700', color: '#1F2937', marginLeft: 4 },
   researchCount: { fontSize: 12, color: '#6B7280' },
 
-  evidenceBadge: { marginTop: 6, flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 8, paddingVertical: 4, borderRadius: 999 },
-  evidenceText: { color: '#fff', fontSize: 12, fontWeight: '700' },
-
-  supplementDerived: { marginBottom: 10 },
-  derivLine: { marginTop: 4, color: '#374151', fontSize: 14 },
-  derivLabel: { fontWeight: '700', color: '#111827' },
-
   supplementDetails: { flexDirection: 'row', gap: 16, marginBottom: 12 },
   detailItem: { flexDirection: 'row', alignItems: 'center' },
   detailLabel: { fontSize: 12, color: '#6B7280', marginRight: 4 },
@@ -666,7 +599,7 @@ const styles = StyleSheet.create({
 
   footer: { height: 100 },
 
-  // --- Styles modale Filtres ---
+  // --- Styles de la modale Filtres ---
   modalContainer: { flex: 1, backgroundColor: '#FFFFFF' },
   modalHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: 20, borderBottomWidth: 1, borderBottomColor: '#E5E7EB' },
   modalTitle: { fontSize: 20, fontWeight: '700', color: '#1F2937' },

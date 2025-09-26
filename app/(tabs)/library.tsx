@@ -1,23 +1,21 @@
+// /home/project/app/(tabs)/library.tsx
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   View, Text, StyleSheet, ScrollView, TouchableOpacity, TextInput, Modal, Alert, Image,
 } from 'react-native';
 import { router } from 'expo-router';
 import { supabase } from '@/lib/supabase';
-import { listObjectiveGroups, type ObjectiveGroup } from '@/lib/queries';
+import { listObjectiveGroups, type ObjectiveGroup, type Supplement } from '@/lib/queries';
 import ProductSuggestionModal from '@/components/ProductSuggestionModal';
-import { Search, Filter, X, ArrowLeft, Star, FileText, Heart } from 'lucide-react-native';
+import { Search, Filter, X, ArrowLeft, Star, FileText, Heart, Award, Euro } from 'lucide-react-native';
+import { useFiches } from '@/hooks/useFiches';
+import {
+  enrichSupplementForDisplay,
+  evidenceColors,
+  evidenceLabels,
+} from '@/lib/supplementDisplayUtils';
 
-type Supplement = {
-  id: string;
-  slug: string;
-  name: string;
-  category: string | null;
-  score_global: number | null;
-  price_eur_month: number | null;
-  research_count: number | null;
-  quality_level: string | null;
-  scores: Record<string, number> | null;
+type SupplementRow = Supplement & {
   objective_groups?: string[];
   has_vegan_tag?: boolean;
 };
@@ -39,8 +37,8 @@ async function detectFavoritesColumn(): Promise<FavCol> {
 }
 
 export default function LibraryScreen() {
-  const [supplements, setSupplements] = useState<Supplement[]>([]);
-  const [filteredSupplements, setFilteredSupplements] = useState<Supplement[]>([]);
+  const [supplements, setSupplements] = useState<SupplementRow[]>([]);
+  const [filteredSupplements, setFilteredSupplements] = useState<SupplementRow[]>([]);
   const [objectiveGroups, setObjectiveGroups] = useState<ObjectiveGroup[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -50,10 +48,13 @@ export default function LibraryScreen() {
   const [filters, setFilters] = useState({
     objectiveGroups: [] as string[],
     vegan: false, minScore: 0, maxPrice: 1000, qualityLevel: '',
-    sortBy: 'score_global', sortOrder: 'desc',
+    sortBy: 'score_global', sortOrder: 'desc' as 'asc' | 'desc',
   });
 
-  // Favoris (compat colonne)
+  // Fiches MD pour enrichissement
+  const { data: ficheMap } = useFiches();
+
+  // Favoris
   const [favCol, setFavCol] = useState<FavCol>('supplement_id');
   const favColRef = useRef<FavCol>('supplement_id');
   const [favReady, setFavReady] = useState(false);
@@ -81,46 +82,53 @@ export default function LibraryScreen() {
     try {
       setLoading(true); setError(null);
 
+      // on récupère aussi "scores" pour harmoniser avec Recos
       const { data: supplementsData, error: fetchError } = await supabase
         .from('supplement')
-        .select('id, slug, name, category, score_global, price_eur_month, research_count, quality_level, scores')
+        .select('id, slug, name, category, score_global, price_eur_month, research_count, quality_level, scores, is_active')
         .eq('is_active', true)
         .order('score_global', { ascending: false, nullsLast: true });
 
       if (fetchError) throw fetchError;
 
-      const supplementsWithTags = await Promise.all(
+      // Tags (JOIN EXPLICITE pour corriger l’ambiguïté 300)
+      const withTags = await Promise.all(
         (supplementsData || []).map(async (s) => {
-          // ⚠️ JOIN AMBIGU : cibler explicitement la FK "tag_slug"
-          // Autre option possible selon ton schéma: objective_tag!fk_sot_objective_tag(...)
           try {
-            const { data: tags, error: tagErr } = await supabase
+            const { data: tags, error: tErr } = await supabase
               .from('supplement_objective_tag')
-              .select(`tag_slug, objective_tag:supplement_objective_tag_tag_slug_fkey(slug,label,group_slug)`)
+              // 👇 préciser la relation FK voulue
+              .select(`tag_slug, objective_tag:objective_tag!fk_sot_objective_tag(slug,label,group_slug)`)
               .eq('supplement_id', s.id);
-
-            if (tagErr) throw tagErr;
+            if (tErr) throw tErr;
 
             const objective_groups = Array.from(new Set(
-              tags?.map((t: any) => t.objective_tag?.group_slug).filter(Boolean) || []
+              (tags || []).map(t => t.objective_tag?.group_slug).filter(Boolean) as string[]
             ));
 
-            const has_vegan_tag =
-              (tags || []).some((t: any) => {
-                const slug = (t.tag_slug ?? '').toLowerCase();
-                const label = (t.objective_tag?.label ?? '').toLowerCase();
-                return slug.includes('vegan') || slug.includes('vegetar') || slug.includes('vegetal') ||
-                       label.includes('vegan') || label.includes('végétar') || label.includes('végétal');
-              });
+            const has_vegan_tag = (tags || []).some((t: any) => {
+              const slug = (t.tag_slug || '').toLowerCase();
+              const label = (t.objective_tag?.label || '').toLowerCase();
+              return slug.includes('vegan') || slug.includes('vegetar') || slug.includes('vegetal')
+                  || label.includes('vegan') || label.includes('végétar') || label.includes('végétal');
+            });
 
-            return { ...s, objective_groups, has_vegan_tag };
+            return { ...(s as any), objective_groups, has_vegan_tag } as SupplementRow;
           } catch {
-            return { ...s, objective_groups: [], has_vegan_tag: false };
+            return { ...(s as any), objective_groups: [], has_vegan_tag: false } as SupplementRow;
           }
         })
       );
 
-      setSupplements(supplementsWithTags);
+      // dédoublonnage défensif
+      const seen = new Set<string>();
+      const unique: SupplementRow[] = [];
+      for (const it of withTags) {
+        const key = String(it.id) + '::' + it.slug;
+        if (!seen.has(key)) { seen.add(key); unique.push(it); }
+      }
+
+      setSupplements(unique);
     } catch (err: any) {
       setError(err.message || 'Erreur lors du chargement des compléments');
     } finally { setLoading(false); }
@@ -149,8 +157,8 @@ export default function LibraryScreen() {
       );
     }
     if (filters.vegan) filtered = filtered.filter(s => s.has_vegan_tag);
-    if (filters.minScore > 0) filtered = filtered.filter(s => s.score_global && s.score_global >= filters.minScore);
-    if (filters.maxPrice < 1000) filtered = filtered.filter(s => !s.price_eur_month || s.price_eur_month <= filters.maxPrice);
+    if (filters.minScore > 0) filtered = filtered.filter(s => (s.score_global ?? 0) >= filters.minScore);
+    if (filters.maxPrice < 1000) filtered = filtered.filter(s => (s.price_eur_month ?? 0) <= filters.maxPrice);
     if (filters.qualityLevel && filters.qualityLevel !== 'Tous') filtered = filtered.filter(s => s.quality_level === filters.qualityLevel);
 
     filtered.sort((a, b) => {
@@ -165,10 +173,10 @@ export default function LibraryScreen() {
     setFilteredSupplements(filtered);
   };
 
-  const handleSupplementPress = (s: Supplement) =>
+  const handleSupplementPress = (s: SupplementRow) =>
     router.push({ pathname: '/supplement-detail', params: { slug: s.slug } });
 
-  const handleViewFiche = (s: Supplement) =>
+  const handleViewFiche = (s: SupplementRow) =>
     router.push({ pathname: '/fiche-produit', params: { slug: s.slug } });
 
   const resetFilters = () => {
@@ -183,7 +191,7 @@ export default function LibraryScreen() {
 
   // ---------- Favoris ----------
   const isIdCol = favCol === 'supplement_id' || favCol === 'supplement';
-  const isFav = (s: Supplement) => favoriteKeys.has(String(isIdCol ? s.id : s.slug));
+  const isFav = (s: SupplementRow) => favoriteKeys.has(String(isIdCol ? s.id : s.slug));
 
   const ensureFavCol = async () => {
     if (favReady) return favColRef.current;
@@ -194,7 +202,7 @@ export default function LibraryScreen() {
     return col;
   };
 
-  const toggleFavorite = async (s: Supplement) => {
+  const toggleFavorite = async (s: SupplementRow) => {
     const col = await ensureFavCol();
     const idBased = col === 'supplement_id' || col === 'supplement';
 
@@ -277,9 +285,12 @@ export default function LibraryScreen() {
 
       <ScrollView style={styles.content} showsVerticalScrollIndicator={false}>
         {filteredSupplements.map((s) => {
+          // enrichissement harmonisé
+          const { dosage, timing, costPerDay, evidence } = enrichSupplementForDisplay(s, ficheMap);
           const fav = isFav(s);
+
           return (
-            <TouchableOpacity key={s.id} style={styles.supplementCard} onPress={() => handleSupplementPress(s)}>
+            <TouchableOpacity key={`${s.id}`} style={styles.supplementCard} onPress={() => handleSupplementPress(s)}>
               <View style={styles.supplementHeader}>
                 <View style={styles.supplementInfo}>
                   <Text style={styles.supplementName}>{s.name}</Text>
@@ -290,31 +301,47 @@ export default function LibraryScreen() {
                   {s.score_global != null && (
                     <View style={styles.scoreContainer}>
                       <Star size={16} color="#F59E0B" fill="#F59E0B" />
-                      <Text style={styles.scoreText}>{s.score_global}/20</Text>
+                      <Text style={styles.scoreText}>{Number(s.score_global).toFixed(1)}/20</Text>
                     </View>
                   )}
                   {s.research_count != null && (
                     <Text style={styles.researchCount}>
-                      {s.research_count} étude{s.research_count > 1 ? 's' : ''}
+                      {s.research_count} étude{s.research_count && s.research_count > 1 ? 's' : ''}
                     </Text>
                   )}
                 </View>
               </View>
 
-              <View style={styles.supplementDetails}>
-                {s.price_eur_month != null && (
-                  <View style={styles.detailItem}>
-                    <Text style={styles.detailLabel}>Prix/mois:</Text>
-                    <Text style={styles.detailValue}>{s.price_eur_month}€</Text>
-                  </View>
-                )}
-                {s.quality_level && (
-                  <View style={styles.detailItem}>
-                    <Text style={styles.detailLabel}>Qualité:</Text>
-                    <Text style={styles.detailValue}>{s.quality_level}</Text>
-                  </View>
-                )}
+              <View style={styles.derivedRow}>
+                <View style={styles.evidenceBadge}>
+                  <Award size={12} color="#fff" />
+                  <Text style={styles.evidenceText}>{evidenceLabels[evidence]}</Text>
+                </View>
+                <View style={styles.derivedItem}>
+                  <Text style={styles.derivedLabel}>Dosage</Text>
+                  <Text style={styles.derivedValue}>{dosage}</Text>
+                </View>
+                <View style={styles.derivedItem}>
+                  <Text style={styles.derivedLabel}>Timing</Text>
+                  <Text style={styles.derivedValue}>{timing}</Text>
+                </View>
+                <View style={styles.derivedItemRow}>
+                  <Euro size={12} color="#6B7280" />
+                  <Text style={[styles.derivedValue, { marginLeft: 4 }]}>
+                    {(costPerDay || 0).toFixed(2)}€/jour
+                  </Text>
+                </View>
               </View>
+
+              {s.scores && Object.keys(s.scores).length > 0 && (
+                <View style={styles.scoresContainer}>
+                  {Object.entries(s.scores).map(([k, v]) => (
+                    <View key={k} style={styles.scoreTag}>
+                      <Text style={styles.scoreTagText}>{k}: {v as any}</Text>
+                    </View>
+                  ))}
+                </View>
+              )}
 
               <View style={styles.supplementActions}>
                 <TouchableOpacity style={styles.ficheButton} onPress={() => handleViewFiche(s)}>
@@ -332,16 +359,6 @@ export default function LibraryScreen() {
                   </Text>
                 </TouchableOpacity>
               </View>
-
-              {s.scores && Object.keys(s.scores).length > 0 && (
-                <View style={styles.scoresContainer}>
-                  {Object.entries(s.scores).map(([k, v]) => (
-                    <View key={k} style={styles.scoreTag}>
-                      <Text style={styles.scoreTagText}>{k}: {v}</Text>
-                    </View>
-                  ))}
-                </View>
-              )}
             </TouchableOpacity>
           );
         })}
@@ -360,7 +377,7 @@ export default function LibraryScreen() {
           </View>
         )}
 
-        <View style={styles.footer} />
+        <View style={{ height: 100 }} />
       </ScrollView>
 
       {/* ---- Modal Filtres & tri ---- */}
@@ -450,7 +467,7 @@ export default function LibraryScreen() {
             <View style={styles.filterSection}>
               <Text style={styles.filterSectionTitle}>Niveau de qualité</Text>
               <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.qualityScroll}>
-                {qualityLevels.map((level) => (
+                {['Tous', ...Array.from(new Set(supplements.map(s => s.quality_level).filter(Boolean)) as any)].map((level) => (
                   <TouchableOpacity
                     key={level}
                     style={[
@@ -566,16 +583,19 @@ const styles = StyleSheet.create({
   scoreText: { fontSize: 16, fontWeight: '700', color: '#1F2937', marginLeft: 4 },
   researchCount: { fontSize: 12, color: '#6B7280' },
 
-  supplementDetails: { flexDirection: 'row', gap: 16, marginBottom: 12 },
-  detailItem: { flexDirection: 'row', alignItems: 'center' },
-  detailLabel: { fontSize: 12, color: '#6B7280', marginRight: 4 },
-  detailValue: { fontSize: 12, fontWeight: '600', color: '#1F2937' },
+  derivedRow: { marginBottom: 10, gap: 8 },
+  evidenceBadge: { alignSelf: 'flex-start', flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 8, paddingVertical: 4, borderRadius: 999, backgroundColor: evidenceColors.A },
+  evidenceText: { color: '#fff', fontSize: 12, fontWeight: '700' },
+  derivedItem: { backgroundColor: '#F9FAFB', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 10 },
+  derivedItemRow: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#F9FAFB', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 10, alignSelf: 'flex-start' },
+  derivedLabel: { fontSize: 12, color: '#6B7280' },
+  derivedValue: { fontSize: 13, fontWeight: '700', color: '#111827', marginTop: 2 },
 
-  scoresContainer: { flexDirection: 'row', flexWrap: 'wrap', gap: 6 },
+  scoresContainer: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginBottom: 10 },
   scoreTag: { backgroundColor: '#EFF6FF', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 6 },
   scoreTagText: { fontSize: 12, fontWeight: '600', color: '#2563EB' },
 
-  supplementActions: { flexDirection: 'row', gap: 8, marginBottom: 12 },
+  supplementActions: { flexDirection: 'row', gap: 8, marginBottom: 4 },
   ficheButton: {
     flex: 1, height: 52, flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
     borderWidth: 1, borderColor: '#2563EB', paddingHorizontal: 12, borderRadius: 12, backgroundColor: '#EFF6FF',
@@ -601,7 +621,6 @@ const styles = StyleSheet.create({
   suggestButtonText: { fontSize: 14, fontWeight: '600', color: '#FFFFFF' },
 
   footer: { height: 100 },
-
   modalContainer: { flex: 1, backgroundColor: '#FFFFFF' },
   modalHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: 20, borderBottomWidth: 1, borderBottomColor: '#E5E7EB' },
   modalTitle: { fontSize: 20, fontWeight: '700', color: '#1F2937' },

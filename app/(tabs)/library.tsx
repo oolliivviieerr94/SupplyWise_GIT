@@ -5,19 +5,45 @@ import {
 } from 'react-native';
 import { router } from 'expo-router';
 import { supabase } from '@/lib/supabase';
-import { listObjectiveGroups, type ObjectiveGroup, type Supplement } from '@/lib/queries';
+import { listObjectiveGroups, type ObjectiveGroup } from '@/lib/queries';
 import ProductSuggestionModal from '@/components/ProductSuggestionModal';
-import { Search, Filter, X, ArrowLeft, Star, FileText, Heart, Award, Euro } from 'lucide-react-native';
-import { useFiches } from '@/hooks/useFiches';
-import {
-  enrichSupplementForDisplay,
-  evidenceColors,
-  evidenceLabels,
-} from '@/lib/supplementDisplayUtils';
+import { Search, Filter, X, ArrowLeft, Star, FileText, Heart, Award, Clock, Euro } from 'lucide-react-native';
 
-type SupplementRow = Supplement & {
+import { useFiches } from '@/hooks/useFiches';
+import { enrichSupplementForDisplay } from '@/lib/supplementDisplayUtils';
+
+/** ---------- Types DB de base ---------- */
+type Supplement = {
+  id: string;
+  slug: string;
+  name: string;
+  category: string | null;
+  score_global: number | null;
+  price_eur_month: number | null;
+  research_count: number | null;
+  quality_level: string | null;
+  scores: Record<string, number> | null;
   objective_groups?: string[];
   has_vegan_tag?: boolean;
+};
+
+/** Infos dérivées à afficher sur la carte */
+type SupplementDisplay = Supplement & {
+  _dosage: string;
+  _timing: string;
+  _evidence: 'A' | 'B' | 'C';
+  _costPerDay: number;
+};
+
+const evidenceColors: Record<'A' | 'B' | 'C', string> = {
+  A: '#10B981',
+  B: '#F59E0B',
+  C: '#EF4444',
+};
+const evidenceLabels: Record<'A' | 'B' | 'C', string> = {
+  A: 'Preuve Forte',
+  B: 'Preuve Modérée',
+  C: 'Preuve Limitée',
 };
 
 type FavCol = 'supplement_id' | 'supplement' | 'supplement_slug';
@@ -37,8 +63,8 @@ async function detectFavoritesColumn(): Promise<FavCol> {
 }
 
 export default function LibraryScreen() {
-  const [supplements, setSupplements] = useState<SupplementRow[]>([]);
-  const [filteredSupplements, setFilteredSupplements] = useState<SupplementRow[]>([]);
+  const [supplements, setSupplements] = useState<SupplementDisplay[]>([]);
+  const [filteredSupplements, setFilteredSupplements] = useState<SupplementDisplay[]>([]);
   const [objectiveGroups, setObjectiveGroups] = useState<ObjectiveGroup[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -48,13 +74,13 @@ export default function LibraryScreen() {
   const [filters, setFilters] = useState({
     objectiveGroups: [] as string[],
     vegan: false, minScore: 0, maxPrice: 1000, qualityLevel: '',
-    sortBy: 'score_global', sortOrder: 'desc' as 'asc' | 'desc',
+    sortBy: 'score_global', sortOrder: 'desc',
   });
 
-  // Fiches MD pour enrichissement
+  // Fiches Markdown (slug -> contenu); utilisé pour enrichir dosage/timing si manquant
   const { data: ficheMap } = useFiches();
 
-  // Favoris
+  // Favoris (compat colonne)
   const [favCol, setFavCol] = useState<FavCol>('supplement_id');
   const favColRef = useRef<FavCol>('supplement_id');
   const [favReady, setFavReady] = useState(false);
@@ -76,59 +102,83 @@ export default function LibraryScreen() {
     })();
   }, []);
 
+  // re-enrichit si les fiches arrivent après coup
+  useEffect(() => {
+    if (!supplements.length) return;
+    setSupplements(prev => prev.map(s => {
+      const enrich = enrichSupplementForDisplay(s as Supplement, ficheMap as any);
+      return { ...s, _dosage: enrich.dosage, _timing: enrich.timing, _evidence: enrich.evidence, _costPerDay: enrich.costPerDay };
+    }));
+  }, [ficheMap]);
+
   useEffect(() => { filterAndSortSupplements(); }, [supplements, searchQuery, filters]);
 
   const loadSupplements = async () => {
     try {
       setLoading(true); setError(null);
 
-      // on récupère aussi "scores" pour harmoniser avec Recos
       const { data: supplementsData, error: fetchError } = await supabase
         .from('supplement')
-        .select('id, slug, name, category, score_global, price_eur_month, research_count, quality_level, scores, is_active')
+        .select('id, slug, name, category, score_global, price_eur_month, research_count, quality_level, scores')
         .eq('is_active', true)
         .order('score_global', { ascending: false, nullsLast: true });
 
       if (fetchError) throw fetchError;
 
-      // Tags (JOIN EXPLICITE pour corriger l’ambiguïté 300)
-      const withTags = await Promise.all(
+      const supplementsWithTags = await Promise.all(
         (supplementsData || []).map(async (s) => {
           try {
-            const { data: tags, error: tErr } = await supabase
+            // Désambiguïsation du JOIN objective_tag (évite l’erreur 300)
+            const { data: tags } = await supabase
               .from('supplement_objective_tag')
-              // 👇 préciser la relation FK voulue
-              .select(`tag_slug, objective_tag:objective_tag!fk_sot_objective_tag(slug,label,group_slug)`)
+              .select(`
+                tag_slug,
+                objective_tag:objective_tag!supplement_objective_tag_tag_slug_fkey (slug,label,group_slug)
+              `)
               .eq('supplement_id', s.id);
-            if (tErr) throw tErr;
 
             const objective_groups = Array.from(new Set(
-              (tags || []).map(t => t.objective_tag?.group_slug).filter(Boolean) as string[]
+              (tags || [])
+                .map((t: any) => t.objective_tag?.group_slug)
+                .filter(Boolean)
             ));
 
             const has_vegan_tag = (tags || []).some((t: any) => {
               const slug = (t.tag_slug || '').toLowerCase();
               const label = (t.objective_tag?.label || '').toLowerCase();
-              return slug.includes('vegan') || slug.includes('vegetar') || slug.includes('vegetal')
-                  || label.includes('vegan') || label.includes('végétar') || label.includes('végétal');
+              return slug.includes('vegan') || slug.includes('vegetar') || slug.includes('vegetal') ||
+                     label.includes('vegan') || label.includes('végétar') || label.includes('végétal');
             });
 
-            return { ...(s as any), objective_groups, has_vegan_tag } as SupplementRow;
+            // Enrichissement (DB → fiche Markdown en fallback)
+            const enrich = enrichSupplementForDisplay(s as Supplement, ficheMap as any);
+
+            const display: SupplementDisplay = {
+              ...s,
+              objective_groups,
+              has_vegan_tag,
+              _dosage: enrich.dosage,
+              _timing: enrich.timing,
+              _evidence: enrich.evidence,
+              _costPerDay: enrich.costPerDay,
+            };
+            return display;
           } catch {
-            return { ...(s as any), objective_groups: [], has_vegan_tag: false } as SupplementRow;
+            const enrich = enrichSupplementForDisplay(s as Supplement, ficheMap as any);
+            return {
+              ...s,
+              objective_groups: [],
+              has_vegan_tag: false,
+              _dosage: enrich.dosage,
+              _timing: enrich.timing,
+              _evidence: enrich.evidence,
+              _costPerDay: enrich.costPerDay,
+            } as SupplementDisplay;
           }
         })
       );
 
-      // dédoublonnage défensif
-      const seen = new Set<string>();
-      const unique: SupplementRow[] = [];
-      for (const it of withTags) {
-        const key = String(it.id) + '::' + it.slug;
-        if (!seen.has(key)) { seen.add(key); unique.push(it); }
-      }
-
-      setSupplements(unique);
+      setSupplements(supplementsWithTags);
     } catch (err: any) {
       setError(err.message || 'Erreur lors du chargement des compléments');
     } finally { setLoading(false); }
@@ -157,12 +207,12 @@ export default function LibraryScreen() {
       );
     }
     if (filters.vegan) filtered = filtered.filter(s => s.has_vegan_tag);
-    if (filters.minScore > 0) filtered = filtered.filter(s => (s.score_global ?? 0) >= filters.minScore);
-    if (filters.maxPrice < 1000) filtered = filtered.filter(s => (s.price_eur_month ?? 0) <= filters.maxPrice);
+    if (filters.minScore > 0) filtered = filtered.filter(s => s.score_global && s.score_global >= filters.minScore);
+    if (filters.maxPrice < 1000) filtered = filtered.filter(s => !s.price_eur_month || s.price_eur_month <= filters.maxPrice);
     if (filters.qualityLevel && filters.qualityLevel !== 'Tous') filtered = filtered.filter(s => s.quality_level === filters.qualityLevel);
 
     filtered.sort((a, b) => {
-      const by = filters.sortBy;
+      const by = filters.sortBy as keyof SupplementDisplay | 'name';
       const order = filters.sortOrder === 'asc' ? 1 : -1;
       const av = (by === 'name') ? a.name : (a as any)[by] || 0;
       const bv = (by === 'name') ? b.name : (b as any)[by] || 0;
@@ -173,10 +223,10 @@ export default function LibraryScreen() {
     setFilteredSupplements(filtered);
   };
 
-  const handleSupplementPress = (s: SupplementRow) =>
+  const handleSupplementPress = (s: SupplementDisplay) =>
     router.push({ pathname: '/supplement-detail', params: { slug: s.slug } });
 
-  const handleViewFiche = (s: SupplementRow) =>
+  const handleViewFiche = (s: SupplementDisplay) =>
     router.push({ pathname: '/fiche-produit', params: { slug: s.slug } });
 
   const resetFilters = () => {
@@ -191,7 +241,7 @@ export default function LibraryScreen() {
 
   // ---------- Favoris ----------
   const isIdCol = favCol === 'supplement_id' || favCol === 'supplement';
-  const isFav = (s: SupplementRow) => favoriteKeys.has(String(isIdCol ? s.id : s.slug));
+  const isFav = (s: SupplementDisplay) => favoriteKeys.has(String(isIdCol ? s.id : s.slug));
 
   const ensureFavCol = async () => {
     if (favReady) return favColRef.current;
@@ -202,7 +252,7 @@ export default function LibraryScreen() {
     return col;
   };
 
-  const toggleFavorite = async (s: SupplementRow) => {
+  const toggleFavorite = async (s: SupplementDisplay) => {
     const col = await ensureFavCol();
     const idBased = col === 'supplement_id' || col === 'supplement';
 
@@ -285,12 +335,10 @@ export default function LibraryScreen() {
 
       <ScrollView style={styles.content} showsVerticalScrollIndicator={false}>
         {filteredSupplements.map((s) => {
-          // enrichissement harmonisé
-          const { dosage, timing, costPerDay, evidence } = enrichSupplementForDisplay(s, ficheMap);
           const fav = isFav(s);
-
+          const costDay = s._costPerDay.toFixed(2);
           return (
-            <TouchableOpacity key={`${s.id}`} style={styles.supplementCard} onPress={() => handleSupplementPress(s)}>
+            <TouchableOpacity key={s.id} style={styles.supplementCard} onPress={() => handleSupplementPress(s)}>
               <View style={styles.supplementHeader}>
                 <View style={styles.supplementInfo}>
                   <Text style={styles.supplementName}>{s.name}</Text>
@@ -301,47 +349,28 @@ export default function LibraryScreen() {
                   {s.score_global != null && (
                     <View style={styles.scoreContainer}>
                       <Star size={16} color="#F59E0B" fill="#F59E0B" />
-                      <Text style={styles.scoreText}>{Number(s.score_global).toFixed(1)}/20</Text>
+                      <Text style={styles.scoreText}>{s.score_global.toFixed(1)}/20</Text>
                     </View>
                   )}
                   {s.research_count != null && (
                     <Text style={styles.researchCount}>
-                      {s.research_count} étude{s.research_count && s.research_count > 1 ? 's' : ''}
+                      {s.research_count} étude{s.research_count > 1 ? 's' : ''}
                     </Text>
                   )}
+                  {/* Badge de preuve */}
+                  <View style={[styles.evidenceBadge, { backgroundColor: evidenceColors[s._evidence] }]}>
+                    <Award size={12} color="#fff" />
+                    <Text style={styles.evidenceText}>{evidenceLabels[s._evidence]}</Text>
+                  </View>
                 </View>
               </View>
 
-              <View style={styles.derivedRow}>
-                <View style={styles.evidenceBadge}>
-                  <Award size={12} color="#fff" />
-                  <Text style={styles.evidenceText}>{evidenceLabels[evidence]}</Text>
-                </View>
-                <View style={styles.derivedItem}>
-                  <Text style={styles.derivedLabel}>Dosage</Text>
-                  <Text style={styles.derivedValue}>{dosage}</Text>
-                </View>
-                <View style={styles.derivedItem}>
-                  <Text style={styles.derivedLabel}>Timing</Text>
-                  <Text style={styles.derivedValue}>{timing}</Text>
-                </View>
-                <View style={styles.derivedItemRow}>
-                  <Euro size={12} color="#6B7280" />
-                  <Text style={[styles.derivedValue, { marginLeft: 4 }]}>
-                    {(costPerDay || 0).toFixed(2)}€/jour
-                  </Text>
-                </View>
+              {/* Infos dérivées harmonisées */}
+              <View style={styles.supplementDerived}>
+                <Text style={styles.derivLine}><Text style={styles.derivLabel}>Dosage : </Text>{s._dosage}</Text>
+                <Text style={styles.derivLine}><Clock size={14} color="#6B7280" /> <Text style={styles.derivLabel}>Timing : </Text>{s._timing}</Text>
+                <Text style={styles.derivLine}><Euro size={14} color="#6B7280" /> <Text style={styles.derivLabel}>Coût/jour : </Text>{costDay}€</Text>
               </View>
-
-              {s.scores && Object.keys(s.scores).length > 0 && (
-                <View style={styles.scoresContainer}>
-                  {Object.entries(s.scores).map(([k, v]) => (
-                    <View key={k} style={styles.scoreTag}>
-                      <Text style={styles.scoreTagText}>{k}: {v as any}</Text>
-                    </View>
-                  ))}
-                </View>
-              )}
 
               <View style={styles.supplementActions}>
                 <TouchableOpacity style={styles.ficheButton} onPress={() => handleViewFiche(s)}>
@@ -359,6 +388,17 @@ export default function LibraryScreen() {
                   </Text>
                 </TouchableOpacity>
               </View>
+
+              {/* Scores détaillés si présents */}
+              {s.scores && Object.keys(s.scores).length > 0 && (
+                <View style={styles.scoresContainer}>
+                  {Object.entries(s.scores).map(([k, v]) => (
+                    <View key={k} style={styles.scoreTag}>
+                      <Text style={styles.scoreTagText}>{k}: {v}</Text>
+                    </View>
+                  ))}
+                </View>
+              )}
             </TouchableOpacity>
           );
         })}
@@ -377,7 +417,7 @@ export default function LibraryScreen() {
           </View>
         )}
 
-        <View style={{ height: 100 }} />
+        <View style={styles.footer} />
       </ScrollView>
 
       {/* ---- Modal Filtres & tri ---- */}
@@ -467,7 +507,7 @@ export default function LibraryScreen() {
             <View style={styles.filterSection}>
               <Text style={styles.filterSectionTitle}>Niveau de qualité</Text>
               <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.qualityScroll}>
-                {['Tous', ...Array.from(new Set(supplements.map(s => s.quality_level).filter(Boolean)) as any)].map((level) => (
+                {qualityLevels.map((level) => (
                   <TouchableOpacity
                     key={level}
                     style={[
@@ -583,19 +623,23 @@ const styles = StyleSheet.create({
   scoreText: { fontSize: 16, fontWeight: '700', color: '#1F2937', marginLeft: 4 },
   researchCount: { fontSize: 12, color: '#6B7280' },
 
-  derivedRow: { marginBottom: 10, gap: 8 },
-  evidenceBadge: { alignSelf: 'flex-start', flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 8, paddingVertical: 4, borderRadius: 999, backgroundColor: evidenceColors.A },
+  evidenceBadge: { marginTop: 6, flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 8, paddingVertical: 4, borderRadius: 999 },
   evidenceText: { color: '#fff', fontSize: 12, fontWeight: '700' },
-  derivedItem: { backgroundColor: '#F9FAFB', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 10 },
-  derivedItemRow: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#F9FAFB', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 10, alignSelf: 'flex-start' },
-  derivedLabel: { fontSize: 12, color: '#6B7280' },
-  derivedValue: { fontSize: 13, fontWeight: '700', color: '#111827', marginTop: 2 },
 
-  scoresContainer: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginBottom: 10 },
+  supplementDerived: { marginBottom: 10 },
+  derivLine: { marginTop: 4, color: '#374151', fontSize: 14 },
+  derivLabel: { fontWeight: '700', color: '#111827' },
+
+  supplementDetails: { flexDirection: 'row', gap: 16, marginBottom: 12 },
+  detailItem: { flexDirection: 'row', alignItems: 'center' },
+  detailLabel: { fontSize: 12, color: '#6B7280', marginRight: 4 },
+  detailValue: { fontSize: 12, fontWeight: '600', color: '#1F2937' },
+
+  scoresContainer: { flexDirection: 'row', flexWrap: 'wrap', gap: 6 },
   scoreTag: { backgroundColor: '#EFF6FF', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 6 },
   scoreTagText: { fontSize: 12, fontWeight: '600', color: '#2563EB' },
 
-  supplementActions: { flexDirection: 'row', gap: 8, marginBottom: 4 },
+  supplementActions: { flexDirection: 'row', gap: 8, marginBottom: 12 },
   ficheButton: {
     flex: 1, height: 52, flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
     borderWidth: 1, borderColor: '#2563EB', paddingHorizontal: 12, borderRadius: 12, backgroundColor: '#EFF6FF',
@@ -621,6 +665,8 @@ const styles = StyleSheet.create({
   suggestButtonText: { fontSize: 14, fontWeight: '600', color: '#FFFFFF' },
 
   footer: { height: 100 },
+
+  // --- Styles modale Filtres ---
   modalContainer: { flex: 1, backgroundColor: '#FFFFFF' },
   modalHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: 20, borderBottomWidth: 1, borderBottomColor: '#E5E7EB' },
   modalTitle: { fontSize: 20, fontWeight: '700', color: '#1F2937' },

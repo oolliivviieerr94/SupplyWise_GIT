@@ -7,12 +7,11 @@ import { RuleModal } from '@/components/RuleModal';
 import { generateForNext2Weeks } from '@/lib/planning';
 import { Grid3X3, Plus, Heart, BookOpen, Award, Clock, Euro, Star } from 'lucide-react-native';
 
-import { searchSupplementsByGroups, getUserObjectiveGroupSlugs, type Supplement } from '@/lib/queries';
+import { searchSupplementsByGroups, type Supplement } from '@/lib/queries';
 import { useFiches } from '@/hooks/useFiches';
 import {
   enrichSupplementForDisplay,
-  evidenceColors,
-  evidenceLabels,
+  uniqueSupplements,
 } from '@/lib/supplementDisplayUtils';
 
 type RecoItem = {
@@ -23,10 +22,63 @@ type RecoItem = {
   costPerDay: number;
 };
 
+const evidenceColors: Record<'A' | 'B' | 'C', string> = { A: '#10B981', B: '#F59E0B', C: '#EF4444' };
+const evidenceLabels: Record<'A' | 'B' | 'C', string> = { A: 'Preuve Forte', B: 'Preuve Modérée', C: 'Preuve Limitée' };
+
+/* ---------- Lecture des groupes utilisateur (fallback intégré) ---------- */
+async function readUserGroupSlugs(): Promise<string[]> {
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return [];
+
+  try {
+    const { data, error } = await supabase
+      .from('user_objective_group')
+      .select('group_slug, objective_group_slug')
+      .eq('user_id', user.id);
+
+    if (!error && data?.length) {
+      const groups = data
+        .map((r: any) => String(r.group_slug ?? r.objective_group_slug ?? ''))
+        .filter(Boolean);
+      if (groups.length) return groups;
+    }
+  } catch {}
+
+  try {
+    const { data: prof } = await supabase
+      .from('user_profiles')
+      .select('objective_groups')
+      .eq('user_id', user.id)
+      .maybeSingle();
+
+    const groups = Array.isArray(prof?.objective_groups)
+      ? (prof!.objective_groups as string[]).map(String).filter(Boolean)
+      : [];
+    if (groups.length) return groups;
+  } catch {}
+
+  try {
+    const { data } = await supabase
+      .from('user_objective')
+      .select('objective_slug')
+      .eq('user_id', user.id);
+    const tags = (data || []).map((r: any) => String(r.objective_slug)).filter(Boolean);
+    if (!tags.length) return [];
+    const { data: tagRows } = await supabase
+      .from('objective_tag')
+      .select('slug, group_slug')
+      .in('slug', tags);
+    return Array.from(new Set((tagRows || []).map((t) => String(t.group_slug)).filter(Boolean)));
+  } catch {
+    return [];
+  }
+}
+
 export default function Recommendations() {
   const params = useLocalSearchParams<{ from?: string; objectives?: string }>();
 
-  const { data: ficheMap } = useFiches(); // map slug → md
+  // Fiches markdown : slug -> contenu (inconnu → util normalise)
+  const { data: ficheMap } = useFiches();
 
   const [loading, setLoading] = useState(false);
   const [tipNoGoals, setTipNoGoals] = useState(false);
@@ -60,7 +112,7 @@ export default function Recommendations() {
       if (!user) { Alert.alert('Connexion requise', 'Connectez-vous pour gérer vos favoris.'); return; }
 
       const willRemove = favIds.has(supplementId);
-      setFavIds(prev => {
+      setFavIds((prev) => {
         const n = new Set(prev);
         willRemove ? n.delete(supplementId) : n.add(supplementId);
         return n;
@@ -84,7 +136,7 @@ export default function Recommendations() {
   // --------- Génération des recommandations ----------
   const objectivesFromParams = useMemo<string[]>(
     () => (typeof params.objectives === 'string' && params.objectives.length
-      ? params.objectives.split(',').map(s => s.trim()).filter(Boolean)
+      ? params.objectives.split(',').map((s) => s.trim()).filter(Boolean)
       : []),
     [params.objectives]
   );
@@ -97,38 +149,38 @@ export default function Recommendations() {
       setTipNoGoals(false);
 
       try {
-        // 1) objectifs : URL > user_objective_group > profil > fallback
+        // 1) Objectifs : URL > tables/fallback interne
         let goals = objectivesFromParams;
-        if (goals.length === 0) {
-          const { data: { user } } = await supabase.auth.getUser();
-          const uid = user?.id;
-          const { slugs, source } = await getUserObjectiveGroupSlugs(uid || undefined);
-          console.log('[reco] goals source=', source, 'count=', slugs.length);
-          goals = slugs;
-        }
+        if (goals.length === 0) goals = await readUserGroupSlugs();
 
         if (goals.length === 0) {
           if (alive) { setTipNoGoals(true); setRecs([]); }
           return;
         }
 
-        // 2) recherche AND stricte
-        const supplements = await searchSupplementsByGroups(goals, true);
+        // 2) Recherche AND stricte et dédoublonnage
+        const supplements = uniqueSupplements(await searchSupplementsByGroups(goals, true));
 
-        // 3) tri score puis #études
+        // 3) Tri score puis #études
         supplements.sort((a, b) => {
-          const sg = (b.score_global ?? (b as any).score_global_adapte ?? 0)
-                   - (a.score_global ?? (a as any).score_global_adapte ?? 0);
+          const sg = (b.score_global || (b as any).score_global_adapte || 0)
+            - (a.score_global || (a as any).score_global_adapte || 0);
           if (sg !== 0) return sg;
           return ((b.research_count ?? (b as any).nb_etudes ?? 0) as number)
-               - ((a.research_count ?? (a as any).nb_etudes ?? 0) as number);
+            - ((a.research_count ?? (a as any).nb_etudes ?? 0) as number);
         });
 
-        // 4) max 15 + enrichissement (dosage/timing/€ jour/preuve) avec fallback fiche MD
+        // 4) max 15 puis enrichissement via fiche (robuste aux types)
         const top = supplements.slice(0, 15);
-        const items: RecoItem[] = top.map(s => {
-          const extra = enrichSupplementForDisplay(s, ficheMap || undefined);
-          return { supplement: s, ...extra };
+        const items: RecoItem[] = top.map((s) => {
+          const enrich = enrichSupplementForDisplay(s, ficheMap as any);
+          return {
+            supplement: s,
+            evidence: enrich.evidence,
+            dosage: enrich.dosage,
+            timing: enrich.timing,
+            costPerDay: enrich.costPerDay,
+          };
         });
 
         if (alive) setRecs(items);
@@ -233,7 +285,7 @@ export default function Recommendations() {
             const dayCost = r.costPerDay.toFixed(2);
 
             return (
-              <View key={String(s.id)} style={styles.card}>
+              <View key={s.id} style={styles.card}>
                 <View style={styles.cardHeader}>
                   <View style={{ flex: 1 }}>
                     <Text style={styles.cardName}>{s.name}</Text>

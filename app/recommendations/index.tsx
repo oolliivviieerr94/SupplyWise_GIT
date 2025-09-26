@@ -9,82 +9,12 @@ import { Grid3X3, Plus, Heart, BookOpen, Award, Clock, Euro, Star } from 'lucide
 
 import { searchSupplementsByGroups, getUserObjectiveGroupSlugs, type Supplement } from '@/lib/queries';
 import { useFiches } from '@/hooks/useFiches';
+import {
+  enrichSupplementForDisplay,
+  evidenceColors,
+  evidenceLabels,
+} from '@/lib/supplementDisplayUtils';
 
-/* -------------------- Parsing du markdown (fiche) -------------------- */
-function stripMd(s: string) {
-  return s
-    .replace(/\*\*/g, '')                 // **bold**
-    .replace(/\u00A0/g, ' ')              // NBSP -> espace
-    .replace(/\s+/g, ' ')                 // espaces multiples
-    .trim();
-}
-function stripLeadingIcons(s: string) {
-  // retire les emojis et symboles en tête (💉, ✅, etc.)
-  return s.replace(/^[^\w(]+/u, '');
-}
-function extractMdDetails(md?: string): { dosage?: string; timing?: string } {
-  if (!md) return {};
-  const lines = md.split('\n');
-  const norm = lines.map(l => stripMd(stripLeadingIcons(l)));
-
-  const idx = norm.findIndex(l =>
-    /(dosage|posologie)(\s+(conseill[ée]e?|recommand[ée]e?))?\s*:/i.test(l)
-  );
-
-  let dosage: string | undefined;
-  let timing: string | undefined;
-
-  if (idx >= 0) {
-    const rawLine = stripMd(lines[idx]);
-    const colon = rawLine.indexOf(':');
-    if (colon !== -1) {
-      const after = rawLine.slice(colon + 1).trim();
-      const value = stripMd(after);
-
-      const tMatch = value.match(
-        /(post[-\s]?workout|pré[-\s]?entraînement|pre[-\s]?workout|intra[-\s]?workout|intra|matin|soir|avant (?:l['’])?entraîn(?:e|e)ment|après (?:l['’])?entraîn(?:e|e)ment|quotidien)/i
-      );
-
-      if (tMatch) {
-        const t = tMatch[1].toLowerCase();
-        if (/post/.test(t)) timing = 'Post-workout';
-        else if (/pré|pre/.test(t)) timing = 'Pré-entraînement';
-        else if (/intra/.test(t)) timing = 'Intra-workout';
-        else if (/matin/.test(t)) timing = 'Matin';
-        else if (/soir/.test(t)) timing = 'Soir';
-        else if (/avant/.test(t)) timing = 'Avant entraînement';
-        else if (/après|apres/.test(t)) timing = 'Après entraînement';
-        else if (/quotidien/.test(t)) timing = 'Quotidien';
-
-        dosage = value.replace(tMatch[0], '').replace(/[–—-]\s*$/,'').trim();
-      } else {
-        dosage = value;
-      }
-    }
-  }
-
-  if (!timing) {
-    const tIdx = norm.findIndex(l => /\btiming\s*:/i.test(l));
-    if (tIdx >= 0) {
-      const raw = stripMd(lines[tIdx]);
-      const colon = raw.indexOf(':');
-      if (colon !== -1) {
-        const v = raw.slice(colon + 1).trim();
-        if (/post/i.test(v)) timing = 'Post-workout';
-        else if (/pré|pre/i.test(v)) timing = 'Pré-entraînement';
-        else if (/intra/i.test(v)) timing = 'Intra-workout';
-        else if (/matin/i.test(v)) timing = 'Matin';
-        else if (/soir/i.test(v)) timing = 'Soir';
-        else if (/quotidien|daily/i.test(v)) timing = 'Quotidien';
-        else timing = v;
-      }
-    }
-  }
-
-  return { dosage, timing };
-}
-
-/* -------------------- Badges & helpers d’affichage -------------------- */
 type RecoItem = {
   supplement: Supplement;
   evidence: 'A' | 'B' | 'C';
@@ -93,73 +23,10 @@ type RecoItem = {
   costPerDay: number;
 };
 
-const evidenceColors: Record<'A'|'B'|'C', string> = { A: '#10B981', B: '#F59E0B', C: '#EF4444' };
-const evidenceLabels: Record<'A'|'B'|'C', string> = { A: 'Preuve Forte', B: 'Preuve Modérée', C: 'Preuve Limitée' };
-
-const getDosage = (s: Supplement) => {
-  const anyS = s as any;
-  if (anyS.dose_usual_min && anyS.dose_unit) {
-    return `${anyS.dose_usual_min}${anyS.dose_unit}${
-      anyS.dose_usual_max ? `–${anyS.dose_usual_max}${anyS.dose_unit}` : ''
-    }`;
-  }
-  const txt =
-    anyS.dosage_recommande ||
-    anyS.dosage ||
-    anyS.posologie ||
-    anyS.dose_label ||
-    anyS.dose_recommandee ||
-    anyS.dose_journaliere;
-  return txt ? String(txt) : 'Selon recommandations';
-};
-
-const getTiming = (s: Supplement) => {
-  const anyS = s as any;
-  const txt =
-    anyS.timing_label ||
-    anyS.frequence ||
-    anyS.timing ||
-    anyS.moment ||
-    anyS.moment_prise ||
-    anyS.moment_de_prise ||
-    anyS.conseil_prise ||
-    anyS.posologie_timing;
-  return txt ? String(txt) : 'Quotidien (timing flexible)';
-};
-
-const getCostPerDay = (s: Supplement) => {
-  const anyS = s as any;
-  const perDay =
-    (typeof anyS.price_eur_day === 'number' ? anyS.price_eur_day : null) ??
-    (typeof anyS.cout_par_jour_eur === 'number' ? anyS.cout_par_jour_eur : null);
-  if (perDay != null) return perDay;
-  const monthly =
-    (typeof s.price_eur_month === 'number' ? s.price_eur_month : null) ??
-    (typeof anyS.cout_moyen_mensuel_eur === 'number' ? anyS.cout_moyen_mensuel_eur : null) ??
-    (typeof anyS.prix_mensuel === 'number' ? anyS.prix_mensuel : null) ??
-    (typeof anyS.cout_mensuel_eur === 'number' ? anyS.cout_mensuel_eur : null) ??
-    (typeof anyS.cout_par_mois_eur === 'number' ? anyS.cout_par_mois_eur : null);
-  return monthly ? monthly / 30 : 0;
-};
-
-const getEvidence = (s: Supplement): 'A'|'B'|'C' => {
-  const anyS = s as any;
-  if (s.quality_level && ['A','B','C'].includes(s.quality_level)) {
-    return s.quality_level as 'A'|'B'|'C';
-  }
-  const raw = (anyS.qualite_etudes || anyS.niveau_preuve || anyS.evidence_level || '').toString().toLowerCase();
-  if (['a','élevée','elevee','elevée','eleve','high','forte','strong'].some(k => raw.includes(k))) return 'A';
-  if (['b','moyenne','medium','modérée','moderee'].some(k => raw.includes(k))) return 'B';
-  if (['c','faible','low','limitée','limitee'].some(k => raw.includes(k))) return 'C';
-  const rc = (s.research_count ?? anyS.nb_etudes ?? anyS.nombre_etudes ?? 0) as number;
-  return rc >= 100 ? 'A' : rc >= 30 ? 'B' : 'C';
-};
-
 export default function Recommendations() {
   const params = useLocalSearchParams<{ from?: string; objectives?: string }>();
 
-  // Fiches markdown : map slug -> contenu
-  const { data: ficheMap } = useFiches();
+  const { data: ficheMap } = useFiches(); // map slug → md
 
   const [loading, setLoading] = useState(false);
   const [tipNoGoals, setTipNoGoals] = useState(false);
@@ -235,7 +102,7 @@ export default function Recommendations() {
         if (goals.length === 0) {
           const { data: { user } } = await supabase.auth.getUser();
           const uid = user?.id;
-          const { slugs, source } = await getUserObjectiveGroupSlugs(uid);
+          const { slugs, source } = await getUserObjectiveGroupSlugs(uid || undefined);
           console.log('[reco] goals source=', source, 'count=', slugs.length);
           goals = slugs;
         }
@@ -250,43 +117,18 @@ export default function Recommendations() {
 
         // 3) tri score puis #études
         supplements.sort((a, b) => {
-          const sg = (b.score_global || (b as any).score_global_adapte || 0)
-                   - (a.score_global || (a as any).score_global_adapte || 0);
+          const sg = (b.score_global ?? (b as any).score_global_adapte ?? 0)
+                   - (a.score_global ?? (a as any).score_global_adapte ?? 0);
           if (sg !== 0) return sg;
           return ((b.research_count ?? (b as any).nb_etudes ?? 0) as number)
                - ((a.research_count ?? (a as any).nb_etudes ?? 0) as number);
         });
 
-        // 4) max 15
+        // 4) max 15 + enrichissement (dosage/timing/€ jour/preuve) avec fallback fiche MD
         const top = supplements.slice(0, 15);
-
-        // 5) enrichissement UI — surcharge depuis la fiche si infos manquantes
         const items: RecoItem[] = top.map(s => {
-          let dosage = getDosage(s);
-          let timing = getTiming(s);
-
-          const hasStructuredDose = Boolean((s as any).dose_usual_min && (s as any).dose_unit);
-
-          const md = ficheMap?.[s.slug];
-          if (md) {
-            const { dosage: mdDosage, timing: mdTiming } = extractMdDetails(md);
-            console.log('[reco][md]', s.slug, '→ dosage:', mdDosage, '| timing:', mdTiming);
-
-            if (!hasStructuredDose && mdDosage) {
-              dosage = mdDosage;
-            }
-            if ((timing === 'Quotidien (timing flexible)' || !timing) && mdTiming) {
-              timing = mdTiming;
-            }
-          }
-
-          return {
-            supplement: s,
-            evidence: getEvidence(s),
-            dosage,
-            timing,
-            costPerDay: getCostPerDay(s),
-          };
+          const extra = enrichSupplementForDisplay(s, ficheMap || undefined);
+          return { supplement: s, ...extra };
         });
 
         if (alive) setRecs(items);
@@ -391,7 +233,7 @@ export default function Recommendations() {
             const dayCost = r.costPerDay.toFixed(2);
 
             return (
-              <View key={s.id} style={styles.card}>
+              <View key={String(s.id)} style={styles.card}>
                 <View style={styles.cardHeader}>
                   <View style={{ flex: 1 }}>
                     <Text style={styles.cardName}>{s.name}</Text>
@@ -417,19 +259,6 @@ export default function Recommendations() {
                   <Text style={styles.infoLine}><Clock size={14} color="#6B7280" /> <Text style={styles.infoLabel}>Timing : </Text>{r.timing}</Text>
                   <Text style={styles.infoLine}><Euro size={14} color="#6B7280" /> <Text style={styles.infoLabel}>Coût/jour : </Text>{dayCost}€</Text>
                 </View>
-
-                {/* --- Scores détaillés (alignés avec Library) --- */}
-                {s.scores && Object.keys(s.scores).length > 0 && (
-                  <View style={styles.scoresContainer}>
-                    {Object.entries(s.scores).map(([k, v]) => (
-                      <View key={k} style={styles.scoreTag}>
-                        <Text style={styles.scoreTagText}>
-                          {k}: {typeof v === 'number' ? v : String(v)}
-                        </Text>
-                      </View>
-                    ))}
-                  </View>
-                )}
 
                 <View style={styles.actionsRow}>
                   <TouchableOpacity
@@ -505,11 +334,6 @@ const styles = StyleSheet.create({
 
   infoLine: { marginTop: 6, color: '#374151', fontSize: 14 },
   infoLabel: { fontWeight: '700', color: '#111827' },
-
-  // --- Scores détaillés ---
-  scoresContainer: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 10 },
-  scoreTag: { backgroundColor: '#EFF6FF', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 6 },
-  scoreTagText: { fontSize: 12, fontWeight: '600', color: '#2563EB' },
 
   actionsRow: { flexDirection: 'row', gap: 10, marginTop: 12, alignItems: 'stretch' },
   detailsBtn: { flex: 1, height: 52, borderRadius: 12, borderWidth: 1, borderColor: '#2563EB', backgroundColor: '#EFF6FF', alignItems: 'center', justifyContent: 'center', flexDirection: 'row' },
